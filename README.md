@@ -1,62 +1,43 @@
 # VNeTraffic for Home Assistant
 
-Custom Home Assistant integration for looking up traffic violations (phạt nguội) by license plate through the VNeTraffic citizen API used by the official Android application.
+Home Assistant custom integration for querying traffic violation (phạt nguội) history from the official VNeTraffic citizen API.
 
-## What it does
+## v0.2.1
 
-- Creates a Home Assistant sensor for a license plate.
-- Reads the VNeTraffic violation-history endpoint.
-- Exposes violation count as the sensor state.
-- Exposes detailed violation records as attributes: time/date, address, violation, detecting/handling unit and status.
-- Supports an optional VNeTraffic Bearer access token when the API requires authentication.
-- Uses a configurable polling interval (default 6 hours).
+- Removed the manual **Access Token** field.
+- Login uses the same basic flow as the VNeTraffic Android app: **username + password**.
+- The integration calls `/auth/logins` and keeps the returned access/refresh tokens internally.
+- When the access token expires, it tries `/auth/refresh-token`; if refresh fails it logs in again.
+- Traffic violation lookup uses `/property/vehicle-violation/history` with `licensePlate`.
+- Credentials are stored in the Home Assistant config entry; tokens are not exposed as configuration fields.
 
-## Important
+## Installation
 
-This project does **not** include or redistribute the VNeTraffic APK. The APK supplied for analysis was used only to identify the official API endpoint and parameter names. The integration calls the official API directly.
+### HACS
+1. Add this repository as a custom HACS repository (Integration).
+2. Install **VNeTraffic**.
+3. Restart Home Assistant.
+4. Go to **Settings → Devices & services → Add integration → VNeTraffic**.
+5. Enter your VNeTraffic **username, password and license plate**.
 
-The VNeTraffic application is an official traffic information application associated with the Traffic Police / GTEL ecosystem. The official application describes traffic-violation lookup by license plate. API availability, authentication requirements and response formats can change at any time.
+### Important
+The APK is not included in this repository. The integration was implemented from the API behavior recovered from the official VNeTraffic Android APK.
 
-## Installation via HACS
-
-1. HACS → Integrations → ⋮ → Custom repositories.
-2. Add this repository URL as an **Integration**.
-3. Install **VNeTraffic**.
-4. Restart Home Assistant.
-5. Settings → Devices & services → Add integration → VNeTraffic.
-6. Enter the license plate without dots or hyphens, for example `30A12345`.
-
-## Entity
-
-Example:
-
-`sensor.vnetraffic_30a12345_phat_nguoi`
-
-The state is the number of violations. The `violations` attribute contains normalized records and `raw` contains the original record returned by the API.
-
-## API recovered from VNeTraffic APK
-
-The current Android APK contains the following violation service endpoint:
-
-`GET /property/vehicle-violation/history`
-
-Parameters recovered from the service definition:
-
-- `licensePlate`
-- `violationStatusCode` (optional)
-- `timeRange` (optional, may be supplied twice as a range)
-- `keySearch` (optional)
-
-The APK also contains the official API base URL:
+## API
+Official citizen API base URL recovered from the APK:
 
 `https://citizen-api.vnetraffic.gov.vn/`
 
-See `tools/apk_analysis.md` for the reverse-engineering notes.
+Authentication endpoints recovered from the APK:
 
-## Authentication
+- `POST /auth/logins`
+- `POST /auth/refresh-token`
 
-The first version deliberately keeps authentication optional. If the official API responds with HTTP 401/403, enter a valid Bearer access token in the integration configuration. Do not put personal credentials, refresh tokens or private keys into GitHub.
+Violation endpoint:
 
-## License
+- `GET /property/vehicle-violation/history`
+- Query: `licensePlate`
 
-MIT. This project is an independent Home Assistant integration and is not affiliated with or endorsed by the VNeTraffic application owner.
+## Home Assistant entity
+
+The integration creates a sensor whose state is the number of violation records. Detailed records are available in the entity attributes, including violation ID, code, name, date/time, address, detecting unit, handling unit and status.
