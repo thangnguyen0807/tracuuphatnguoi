@@ -1,6 +1,6 @@
 DOMAIN = "vnetraffic"
 NAME = "VNeTraffic"
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 DEFAULT_BASE_URL = "https://citizen-api.vnetraffic.gov.vn/"
 DEFAULT_SCAN_INTERVAL = 21600
 CONF_USERNAME = "username"
@@ -13,3 +13,10 @@ VEHICLE_TYPES = {
     "motorcycle": "Xe máy",
     "other": "Khác",
 }
+
+# Header values observed in the official Android APK.
+API_VERSION = "1.2"
+X_API_VERSION = "0.2.87"
+APP_VERSION = "1.1.44"
+APP_VERSION_CODE = "185"
+PLATFORM = "ANDROID"

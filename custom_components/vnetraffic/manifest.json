@@ -1,11 +1,15 @@
 {
   "domain": "vnetraffic",
   "name": "VNeTraffic",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "documentation": "https://github.com/thangnguyen0807/vnetraffic-hass",
   "issue_tracker": "https://github.com/thangnguyen0807/vnetraffic-hass/issues",
-  "codeowners": ["@thangnguyen0807"],
+  "codeowners": [
+    "@thangnguyen0807"
+  ],
   "config_flow": true,
   "iot_class": "cloud_polling",
-  "requirements": ["aiohttp>=3.9.0,<4.0.0"]
+  "requirements": [
+    "aiohttp>=3.9.0,<4.0.0"
+  ]
 }

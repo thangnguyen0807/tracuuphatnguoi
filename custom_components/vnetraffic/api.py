@@ -3,10 +3,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 import json
+import hashlib
+import uuid
 
 import aiohttp
 
-from .const import DEFAULT_BASE_URL, VERSION
+from .const import (
+    API_VERSION,
+    APP_VERSION,
+    APP_VERSION_CODE,
+    DEFAULT_BASE_URL,
+    PLATFORM,
+    VERSION,
+    X_API_VERSION,
+)
 
 
 class VNeTrafficError(Exception):
@@ -20,38 +30,36 @@ class LookupResult:
 
 
 class VNeTrafficApi:
-    """Small client for the official VNeTraffic citizen API.
+    """Client matching the official VNeTraffic Android API flow."""
 
-    The Android APK uses username/password to call /auth/logins. The API then
-    returns an access token (and a refresh token). Tokens are kept in memory
-    only; the user never has to paste an access token into Home Assistant.
-    """
-
-    def __init__(
-        self,
-        session: aiohttp.ClientSession,
-        username: str,
-        password: str,
-        base_url: str = DEFAULT_BASE_URL,
-    ) -> None:
+    def __init__(self, session: aiohttp.ClientSession, username: str, password: str, base_url: str = DEFAULT_BASE_URL) -> None:
         self.session = session
         self.username = username.strip()
         self.password = password
         self.base_url = base_url.rstrip("/")
         self.access_token: str | None = None
         self.refresh_token: str | None = None
+        self.device_id = _stable_device_id(self.username)
 
-    def _headers(self, authenticated: bool = False) -> dict[str, str]:
-        headers = {
+    def _headers(self, authenticated: bool = False, include_app_headers: bool = True) -> dict[str, str]:
+        headers: dict[str, str] = {
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "User-Agent": f"Home Assistant VNeTraffic Integration/{VERSION}",
+            "Platform": PLATFORM,
+            "Ver": APP_VERSION,
+            "VerCode": APP_VERSION_CODE,
+            "App-Version": APP_VERSION,
+            "X-API-VERSION": X_API_VERSION,
+            "api-version": API_VERSION,
+            "User-Agent": f"VNeTraffic/{APP_VERSION} (Home Assistant; {VERSION})",
         }
+        # Keep the login request close to the APK's base header.
+        if include_app_headers:
+            headers["Device-Id"] = self.device_id
+            headers["Device-Info"] = "Home Assistant"
         if authenticated and self.access_token:
             token = self.access_token
-            if not token.lower().startswith("bearer "):
-                token = f"Bearer {token}"
-            headers["Authorization"] = token
+            headers["Authorization"] = token if token.lower().startswith("bearer ") else f"Bearer {token}"
         return headers
 
     async def login(self) -> None:
@@ -59,19 +67,19 @@ class VNeTrafficApi:
             raise VNeTrafficError("Chưa cấu hình tài khoản hoặc mật khẩu VNeTraffic")
 
         url = f"{self.base_url}/auth/logins"
-        payload = {"username": self.username, "password": self.password}
+        # AuthRequest.kt: citizenIdentify, password, fcmToken, latitude, longitude.
+        # Gson omits nulls by default, so optional APK fields are omitted here.
+        payload = {
+            "citizenIdentify": self.username,
+            "password": self.password,
+        }
         try:
             async with self.session.post(
-                url,
-                json=payload,
-                headers=self._headers(),
-                timeout=aiohttp.ClientTimeout(total=20),
+                url, json=payload, headers=self._headers(), timeout=aiohttp.ClientTimeout(total=20)
             ) as response:
                 text = await response.text()
                 if response.status >= 400:
                     message = _api_message(text)
-                    if response.status in (400, 401, 403):
-                        raise VNeTrafficError(f"Đăng nhập VNeTraffic thất bại: {message}")
                     raise VNeTrafficError(f"VNeTraffic API đăng nhập HTTP {response.status}: {message}")
                 try:
                     data = await response.json(content_type=None)
@@ -80,10 +88,10 @@ class VNeTrafficApi:
         except aiohttp.ClientError as err:
             raise VNeTrafficError(f"Không kết nối được VNeTraffic API: {err}") from err
 
-        access = find_first(data, "accessToken", "token", "access_token")
-        refresh = find_first(data, "refreshToken", "refresh_token")
+        access = find_first(data, "accessToken", "accessTKN", "token", "access_token")
+        refresh = find_first(data, "refreshToken", "refreshTKN", "refresh_token")
         if not access:
-            message = find_first(data, "message", "msg", "errorMessage") or "Không nhận được access token"
+            message = find_first(data, "message", "msg", "errorMessage", "error") or "Không nhận được access token"
             raise VNeTrafficError(f"Đăng nhập VNeTraffic không thành công: {message}")
         self.access_token = str(access)
         self.refresh_token = str(refresh) if refresh else None
@@ -92,13 +100,11 @@ class VNeTrafficApi:
         if not self.refresh_token:
             return False
         url = f"{self.base_url}/auth/refresh-token"
+        # RefreshTokenRequest.kt: refreshToken, fcmToken, latitude, longitude.
         payload = {"refreshToken": self.refresh_token}
         try:
             async with self.session.post(
-                url,
-                json=payload,
-                headers=self._headers(),
-                timeout=aiohttp.ClientTimeout(total=20),
+                url, json=payload, headers=self._headers(), timeout=aiohttp.ClientTimeout(total=20)
             ) as response:
                 text = await response.text()
                 if response.status >= 400:
@@ -110,8 +116,8 @@ class VNeTrafficApi:
         except aiohttp.ClientError:
             return False
 
-        access = find_first(data, "accessToken", "token", "access_token")
-        refresh = find_first(data, "refreshToken", "refresh_token")
+        access = find_first(data, "accessToken", "accessTKN", "token", "access_token")
+        refresh = find_first(data, "refreshToken", "refreshTKN", "refresh_token")
         if not access:
             return False
         self.access_token = str(access)
@@ -135,20 +141,17 @@ class VNeTrafficApi:
         for attempt in range(2):
             try:
                 async with self.session.get(
-                    url,
-                    params=params,
-                    headers=self._headers(authenticated=True),
-                    timeout=aiohttp.ClientTimeout(total=20),
+                    url, params=params, headers=self._headers(authenticated=True), timeout=aiohttp.ClientTimeout(total=20)
                 ) as response:
                     text = await response.text()
                     if response.status in (401, 403) and attempt == 0:
                         if await self.refresh():
                             continue
+                        self.access_token = None
                         await self.login()
                         continue
                     if response.status >= 400:
-                        message = _api_message(text)
-                        raise VNeTrafficError(f"VNeTraffic API HTTP {response.status}: {message}")
+                        raise VNeTrafficError(f"VNeTraffic API HTTP {response.status}: {_api_message(text)}")
                     try:
                         data = await response.json(content_type=None)
                     except Exception as err:
@@ -164,14 +167,16 @@ class VNeTrafficApi:
         return LookupResult(raw=data, violations=extract_violations(data))
 
 
+def _stable_device_id(username: str) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, "vnetraffic-ha:" + username))
+
+
 def normalize_plate(value: str) -> str:
     return "".join(ch for ch in value.upper().strip() if ch.isalnum())
 
 
 def find_first(data: Any, *names: str) -> Any:
-    """Recursively find a field in common API response envelopes."""
     wanted = {n.lower() for n in names}
-
     def walk(obj: Any, depth: int = 0) -> Any:
         if depth > 8:
             return None
@@ -189,14 +194,13 @@ def find_first(data: Any, *names: str) -> Any:
                 if result not in (None, ""):
                     return result
         return None
-
     return walk(data)
 
 
 def _api_message(text: str) -> str:
     try:
         data = json.loads(text)
-        message = find_first(data, "message", "msg", "errorMessage", "error")
+        message = find_first(data, "message", "msg", "errorMessage", "error", "error_message")
         if message:
             return str(message)[:300]
     except Exception:
@@ -205,9 +209,7 @@ def _api_message(text: str) -> str:
 
 
 def extract_violations(data: Any) -> list[dict[str, Any]]:
-    """Find violation records despite minor response-envelope changes."""
     found: list[dict[str, Any]] = []
-
     def walk(obj: Any, depth: int = 0) -> None:
         if depth > 8:
             return
@@ -219,7 +221,6 @@ def extract_violations(data: Any) -> list[dict[str, Any]]:
         elif isinstance(obj, list):
             for item in obj:
                 walk(item, depth + 1)
-
     walk(data)
     unique: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -233,17 +234,7 @@ def extract_violations(data: Any) -> list[dict[str, Any]]:
 
 def looks_like_violation(item: dict[str, Any]) -> bool:
     keys = {str(k).lower() for k in item}
-    markers = {
-        "violationid", "violationhistoryid", "violationname",
-        "violationcode", "violationaddress", "violationdate",
-        "violationstatuscode",
-    }
-    return bool(keys & markers)
-
-
-def first_value(item: dict[str, Any], *names: str) -> Any:
-    lower = {str(k).lower(): v for k, v in item.items()}
-    for name in names:
-        if name.lower() in lower and lower[name.lower()] not in (None, ""):
-            return lower[name.lower()]
-    return None
+    return bool(keys & {
+        "violationid", "violationhistoryid", "violationname", "violationcode",
+        "violationaddress", "violationdate", "violationstatuscode",
+    })
