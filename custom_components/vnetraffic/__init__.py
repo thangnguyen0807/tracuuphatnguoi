@@ -5,7 +5,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import VNeTrafficApi
-from .const import CONF_ACCESS_TOKEN, CONF_LICENSE_PLATE, CONF_SCAN_INTERVAL, DOMAIN
+from .const import CONF_LICENSE_PLATE, CONF_PASSWORD, CONF_SCAN_INTERVAL, CONF_USERNAME, DOMAIN
 from .coordinator import VNeTrafficCoordinator
 
 PLATFORMS = ["sensor"]
@@ -13,7 +13,11 @@ PLATFORMS = ["sensor"]
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     session = async_get_clientsession(hass)
-    api = VNeTrafficApi(session, entry.data.get(CONF_ACCESS_TOKEN))
+    api = VNeTrafficApi(
+        session,
+        username=entry.data[CONF_USERNAME],
+        password=entry.data[CONF_PASSWORD],
+    )
     coordinator = VNeTrafficCoordinator(
         hass,
         api,
