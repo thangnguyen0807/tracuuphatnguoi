@@ -34,6 +34,7 @@ class VNeTrafficError(Exception):
 class LookupResult:
     raw: dict[str, Any]
     violations: list[dict[str, Any]]
+    debug: dict[str, Any]
 
 
 class VNeTrafficApi:
@@ -167,36 +168,129 @@ class VNeTrafficApi:
 
         await self._ensure_authenticated()
         await self._load_remote_config()
-        url = f"{self.base_url}/property/vehicle-violation/history"
-        params = {"licensePlate": plate}
 
-        for attempt in range(2):
+        debug_requests: list[dict[str, Any]] = []
+        data: dict[str, Any] = {}
+        http_status = 0
+        raw_text_snapshot = ""
+        last_error: str | None = None
+
+        async def get_json(path: str, params: list[tuple[str, str]] | None = None) -> tuple[int, Any, str]:
+            url = f"{self.base_url}/{path.lstrip('/')}"
             try:
                 async with self.session.get(
-                    url, params=params, headers=self._headers(authenticated=True), timeout=aiohttp.ClientTimeout(total=20)
+                    url,
+                    params=params,
+                    headers=self._headers(authenticated=True),
+                    timeout=aiohttp.ClientTimeout(total=20),
                 ) as response:
                     text = await response.text()
-                    if response.status in (401, 403) and attempt == 0:
-                        if await self.refresh():
-                            continue
-                        self.access_token = None
-                        await self.login()
-                        continue
-                    if response.status >= 400:
-                        raise VNeTrafficError(f"VNeTraffic API HTTP {response.status}: {_api_message(text)}")
                     try:
-                        data = await response.json(content_type=None)
-                    except Exception as err:
-                        raise VNeTrafficError(f"API trả về dữ liệu không phải JSON: {text[:300]}") from err
-                    break
+                        payload = await response.json(content_type=None)
+                    except Exception:
+                        payload = None
+                    return response.status, payload, text
             except aiohttp.ClientError as err:
                 raise VNeTrafficError(f"Không kết nối được VNeTraffic API: {err}") from err
-        else:
-            raise VNeTrafficError("Không thể xác thực với VNeTraffic API")
 
-        if not isinstance(data, dict):
-            data = {"data": data}
-        return LookupResult(raw=data, violations=extract_violations(data))
+        # The APK exposes a dedicated pending-fine resource. Use it directly for
+        # unresolved violations instead of guessing status codes on history.
+        pending_url = f"{self.base_url}/property/pending/fine"
+        status, pending_data, pending_text = await get_json("property/pending/fine")
+        debug_requests.append({
+            "endpoint": "/pending/fine",
+            "params": [],
+            "http_status": status,
+            "extracted_count": len(extract_violations(pending_data)),
+            "server_total": _find_count_fields(pending_data).get("total") if isinstance(pending_data, (dict, list)) else None,
+            "response_preview": pending_text[:1600],
+        })
+
+        pending_rows = extract_violations(pending_data) if pending_data is not None else []
+        pending_plate_rows = [
+            row for row in pending_rows
+            if normalize_plate(str(find_first(row, "licensePlate", "licensePlateEncrypt", "plate", "vehiclePlate") or "")) == plate
+        ]
+
+        # Main history request: one clean request only. The previous versions sent
+        # dozens of speculative requests, which triggered the upstream WAF.
+        history_url = f"{self.base_url}/property/vehicle-violation/history"
+        history_params = [("licensePlate", plate)]
+        status, history_data, history_text = await get_json(
+            "property/vehicle-violation/history", history_params
+        )
+        http_status = status
+        raw_text_snapshot = history_text[:4000]
+        history_rows = extract_violations(history_data)
+        server_total = _find_count_fields(history_data).get("total") if isinstance(history_data, (dict, list)) else None
+        debug_requests.append({
+            "endpoint": "/property/vehicle-violation/history",
+            "params": history_params,
+            "http_status": status,
+            "extracted_count": len(history_rows),
+            "server_total": server_total,
+            "response_preview": history_text[:1600],
+        })
+
+        # The APK also exposes the dashboard violations resource. It is useful as
+        # a count/aggregate fallback when vehicle history is not populated for the
+        # logged-in account. Do one deterministic request only.
+        dashboard_url = f"{self.base_url}/property/dashboard/violations"
+        d_status, dashboard_data, dashboard_text = await get_json("property/dashboard/violations")
+        dashboard_rows = extract_violations(dashboard_data) if dashboard_data is not None else []
+        dashboard_total = _find_count_fields(dashboard_data).get("total") if isinstance(dashboard_data, (dict, list)) else None
+        debug_requests.append({
+            "endpoint": "/property/dashboard/violations",
+            "params": [],
+            "http_status": d_status,
+            "extracted_count": len(dashboard_rows),
+            "server_total": dashboard_total,
+            "response_preview": dashboard_text[:1600],
+        })
+
+        # Prefer history rows for the complete violation list. If that endpoint is
+        # empty but pending/fine contains rows for this plate, expose those rows so
+        # the unresolved counter still reflects the official pending resource.
+        violations = history_rows if history_rows else pending_plate_rows
+        if not violations and dashboard_rows:
+            violations = [
+                row for row in dashboard_rows
+                if normalize_plate(str(find_first(row, "licensePlate", "licensePlateEncrypt", "plate", "vehiclePlate") or "")) == plate
+            ] or dashboard_rows
+        data = history_data if isinstance(history_data, dict) else {}
+        if pending_data is not None:
+            data = dict(data)
+            data["_pending_fine"] = pending_data
+            data["_pending_fine_rows_for_plate"] = pending_plate_rows
+        if dashboard_data is not None:
+            data = dict(data)
+            data["_dashboard_violations"] = dashboard_data
+            data["_dashboard_violations_rows"] = dashboard_rows
+
+        if status >= 400:
+            last_error = f"HTTP {status}: {_api_message(history_text)}"
+        if status == 200 and not history_rows and pending_plate_rows:
+            data["_effective_violation_source"] = "property/pending/fine"
+        elif not history_rows:
+            data["_effective_violation_source"] = "none"
+
+        debug = build_response_debug(
+            data=data,
+            text=raw_text_snapshot,
+            http_status=http_status,
+            url=history_url,
+            plate=plate,
+            violations=violations,
+        )
+        debug["pending_fine_url"] = pending_url
+        debug["pending_fine_rows_for_plate"] = len(pending_plate_rows)
+        debug["dashboard_violations_url"] = dashboard_url
+        debug["dashboard_violations_rows"] = len(dashboard_rows)
+        debug["history_rows"] = len(history_rows)
+        debug["request_profiles"] = debug_requests
+        if last_error:
+            debug["last_error"] = last_error
+        return LookupResult(raw=data, violations=violations, debug=debug)
 
 
 def encrypt_apk_payload(payload: dict[str, Any], public_key_pem: str) -> tuple[str, str]:
@@ -289,69 +383,307 @@ def _api_message(text: str) -> str:
     return text[:300] or "Lỗi không xác định"
 
 
+def _parse_json_string(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    candidate = value.strip()
+    if not candidate or candidate[0] not in "[{":
+        return value
+    try:
+        return json.loads(candidate)
+    except Exception:
+        return value
+
+
+def _key_norm(key: Any) -> str:
+    return str(key).strip().lower().replace("-", "").replace("_", "")
+
+
+def _looks_like_violation_record(item: dict[str, Any]) -> bool:
+    keys = {_key_norm(k) for k in item}
+    exact = {
+        "violationid", "violationhistoryid", "vehicleviolationhistoryid",
+        "violationname", "violationcode", "violationaddress",
+        "violationdate", "violationat", "violationtime",
+        "violationstatuscode", "violationstatusname", "violationtypename",
+        "violationtype", "violationreason", "licenseplate", "licenseplateencrypt",
+    }
+    if keys & exact:
+        # Do not accept a summary object merely because it contains a count field.
+        return len(keys & {"violationid", "violationhistoryid", "vehicleviolationhistoryid",
+                           "violationname", "violationcode", "violationtype", "violationreason"}) > 0
+
+    id_keys = {"id", "idcrypt", "idencrypt", "recordid"}
+    time_keys = {"date", "datetime", "createdat", "updatedat", "violationdate", "violationat", "violationtime"}
+    type_keys = {"type", "name", "reason", "description", "content", "violation"}
+    status_keys = {"status", "statuscode", "statusname", "paymentstatus", "paymentstatuscode", "paymentstatusname"}
+    plate_keys = {"plate", "licenseplate", "licenseplateencrypt", "vehicleplate"}
+    if (keys & id_keys) and ((keys & time_keys) or (keys & type_keys) or (keys & status_keys)):
+        return True
+    if (keys & plate_keys) and ((keys & time_keys) or (keys & type_keys) or (keys & status_keys)):
+        return True
+    return False
+
+
+def looks_like_violation(item: dict[str, Any]) -> bool:
+    return _looks_like_violation_record(item)
+
+
+def _flatten_embedded_json(obj: Any, depth: int = 0) -> Any:
+    if depth > 8:
+        return obj
+    obj = _parse_json_string(obj)
+    if isinstance(obj, dict):
+        return {k: _flatten_embedded_json(v, depth + 1) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_flatten_embedded_json(v, depth + 1) for v in obj]
+    return obj
+
+
 def extract_violations(data: Any) -> list[dict[str, Any]]:
-    """Extract violation records from the API's nested/paginated response.
+    """Extract violation rows from all common VNeTraffic response shapes.
 
-    The Android client maps the history response into DTOs whose field names vary
-    slightly across backend revisions. Accept both the known violation-prefixed
-    fields and the generic record shape used by paginated responses.
+    The official app/backend has changed wrappers over time (data/result/content/items,
+    nested pagination, or JSON encoded strings). We flatten embedded JSON, prioritize
+    arrays with violation-like names, and also inspect generic records.
     """
+    root = _flatten_embedded_json(data)
     found: list[dict[str, Any]] = []
+    preferred_array_names = {
+        "violations", "violationlist", "violationhistory", "records", "items",
+        "content", "results", "result", "data", "list", "rows",
+    }
 
-    def walk(obj: Any, depth: int = 0) -> None:
-        if depth > 12:
+    def walk(obj: Any, depth: int = 0, preferred: bool = False) -> None:
+        if depth > 14:
             return
         if isinstance(obj, dict):
-            if looks_like_violation(obj):
+            if _looks_like_violation_record(obj):
                 found.append(obj)
-            for value in obj.values():
-                walk(value, depth + 1)
+            for key, value in obj.items():
+                name = _key_norm(key)
+                child_preferred = preferred or name in {_key_norm(x) for x in preferred_array_names}
+                if isinstance(value, (dict, list)):
+                    walk(value, depth + 1, child_preferred)
         elif isinstance(obj, list):
             for item in obj:
-                walk(item, depth + 1)
+                if isinstance(item, dict) and (_looks_like_violation_record(item) or preferred):
+                    if isinstance(item, dict):
+                        found.append(item) if _looks_like_violation_record(item) else None
+                walk(item, depth + 1, preferred)
 
-    walk(data)
+    walk(root)
 
     unique: list[dict[str, Any]] = []
     seen: set[str] = set()
     for item in found:
-        key = (
-            str(find_first(item, "violationHistoryId", "vehicleViolationHistoryId", "violationId", "idEncrypt", "id"))
-            or json.dumps(item, sort_keys=True, ensure_ascii=False)
+        key_value = find_first(
+            item,
+            "violationHistoryId", "vehicleViolationHistoryId", "violationId",
+            "idEncrypt", "id", "recordId",
         )
+        if key_value not in (None, ""):
+            key = f"id:{key_value}"
+        else:
+            key = "json:" + json.dumps(item, sort_keys=True, ensure_ascii=False, default=str)
         if key not in seen:
             seen.add(key)
             unique.append(item)
     return unique
 
 
-def looks_like_violation(item: dict[str, Any]) -> bool:
-    keys = {str(k).lower() for k in item}
+def _collect_shape_paths(obj: Any, path: str = "$", out: list[dict[str, Any]] | None = None, depth: int = 0) -> list[dict[str, Any]]:
+    if out is None:
+        out = []
+    if depth > 8:
+        return out
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            p = f"{path}.{k}"
+            if isinstance(v, list):
+                out.append({"path": p, "type": "list", "length": len(v)})
+            elif isinstance(v, dict):
+                out.append({"path": p, "type": "dict", "keys": list(v.keys())[:30]})
+            elif isinstance(v, str) and v[:1] in "[{":
+                try:
+                    parsed = json.loads(v)
+                    out.append({"path": p, "type": "json_string", "parsed_type": type(parsed).__name__})
+                except Exception:
+                    pass
+            _collect_shape_paths(v, p, out, depth + 1)
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj[:20]):
+            _collect_shape_paths(v, f"{path}[{i}]", out, depth + 1)
+    return out
 
-    # Exact fields observed in VNeTraffic's violation DTOs.
-    if keys & {
-        "violationid", "violationhistoryid", "vehicleviolationhistoryid",
-        "violationname", "violationcode", "violationaddress",
-        "violationdate", "violationat", "violationtime",
-        "violationstatuscode", "violationstatusname", "violationtypename",
-    }:
-        return True
 
-    # Backend revisions may expose a generic record with plate + time/type/status.
-    generic = {
-        "licenseplate", "licenseplateencrypt", "plate",
-        "violationtype", "violationreason", "violationattext",
-        "violationdatetext", "violationtimetext", "address",
-        "status", "statuscode", "statusname",
+def build_response_debug(
+    data: dict[str, Any],
+    text: str,
+    http_status: int,
+    url: str,
+    plate: str,
+    violations: list[dict[str, Any]],
+) -> dict[str, Any]:
+    keys = list(data.keys())[:50]
+    shapes = _collect_shape_paths(data)
+    counts = _find_count_fields(data)
+    return {
+        "http_status": http_status,
+        "url": url,
+        "license_plate": plate,
+        "top_level_keys": keys,
+        "violation_count_extracted": len(violations),
+        "server_count_fields": counts,
+        "shape_paths": shapes[:120],
+        "raw_response_preview": text[:4000],
     }
-    score = len(keys & generic)
-    if score >= 2 and ("id" in keys or "violationtype" in keys or "violationreason" in keys):
-        return True
 
-    # Some paginated APIs return records with only id + date + amount/status.
-    time_keys = {"date", "createdat", "updatedat", "violationdate", "violationat", "violationtime"}
-    money_keys = {"penalty", "penaltyamount", "fineamount", "amount", "money"}
-    if "id" in keys and (keys & time_keys) and (keys & money_keys or keys & {"status", "statuscode", "statusname"}):
-        return True
 
-    return False
+def _status_values(violation: dict[str, Any]) -> list[tuple[str, Any]]:
+    values: list[tuple[str, Any]] = []
+    status_names = {
+        "violationstatusname", "violationstatuscode", "statusname", "statuscode", "status",
+        "paymentstatusname", "paymentstatuscode", "paymentstatus", "processstatus", "processstatusname",
+        "handlingstatus", "handlingstatusname", "paidstatus", "paid", "ispaid", "ispayed",
+        "resolved", "isresolved", "processed", "isprocessed", "handled", "ishandled",
+    }
+    def walk(obj: Any, depth: int = 0) -> None:
+        if depth > 8:
+            return
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                nk = _key_norm(key)
+                if nk in status_names or any(token in nk for token in ("status", "paid", "resolved", "processed", "handled")):
+                    if not isinstance(value, (dict, list)):
+                        values.append((str(key), value))
+                elif isinstance(value, (dict, list)):
+                    walk(value, depth + 1)
+        elif isinstance(obj, list):
+            for value in obj:
+                walk(value, depth + 1)
+    walk(violation)
+    return values
+
+
+def _norm_text(value: Any) -> str:
+    return "" if value is None else str(value).strip().lower()
+
+
+def _status_debug(violation: dict[str, Any]) -> dict[str, Any]:
+    return {"id": first_value(violation, "violationHistoryId", "vehicleViolationHistoryId", "violationId", "id"),
+            "status": _status_values(violation)}
+
+
+def _is_explicit_resolved(status: str) -> bool:
+    status = _norm_text(status)
+    return any(marker in status for marker in (
+        "đã xử phạt", "da xu phat", "đã nộp phạt", "da nop phat", "đã thanh toán", "da thanh toan",
+        "đã giải quyết", "da giai quyet", "đã xử lý", "da xu ly", "paid", "resolved", "processed",
+        "handled", "settled", "finished", "completed", "true",
+    ))
+
+
+def _is_explicit_unresolved(status: str) -> bool:
+    status = _norm_text(status)
+    return any(marker in status for marker in (
+        "chưa xử phạt", "chua xu phat", "chưa nộp phạt", "chua nop phat",
+        "chưa xử lý", "chua xu ly", "chưa giải quyết", "chua giai quyet",
+        "chưa thanh toán", "chua thanh toan", "chưa hoàn tất", "chua hoan tat",
+        "chưa chấp hành", "chua chap hanh", "chờ xử lý", "cho xu ly",
+        "pending", "unpaid", "unresolved", "outstanding", "waiting", "new",
+        "not handled", "unhandled", "false",
+    ))
+
+
+def _is_unresolved_violation(violation: dict[str, Any]) -> bool:
+    values = _status_values(violation)
+    if not values:
+        return True
+    unresolved_seen = False
+    resolved_seen = False
+    meaningful = 0
+    for _, value in values:
+        status = _norm_text(value)
+        if not status:
+            continue
+        meaningful += 1
+        if _is_explicit_unresolved(status):
+            unresolved_seen = True
+        elif _is_explicit_resolved(status):
+            resolved_seen = True
+    if unresolved_seen:
+        return True
+    if meaningful and resolved_seen:
+        return False
+    return True
+
+
+def _find_count_fields(obj: Any) -> dict[str, int]:
+    out: dict[str, int] = {}
+    unresolved_tokens = (
+        "unresolved", "unprocessed", "unhandled", "pending", "unpaid",
+        "notprocessed", "not_processed", "notpaid", "not_paid",
+        "chua_xu_phat", "chuaxuphat", "chua_xu_ly", "chuaxuly",
+        "chua_nop_phat", "chuanopphat", "chua_thanh_toan", "chuathanhtoan",
+    )
+    resolved_tokens = (
+        "resolved", "processed", "handled", "paid", "settled", "completed",
+        "processedviolations", "paidviolations", "handledviolations",
+    )
+    total_tokens = ("totalviolations", "violationcount", "totalviolationcount", "total")
+
+    def walk(x: Any, depth: int = 0) -> None:
+        if depth > 10:
+            return
+        if isinstance(x, dict):
+            for key, value in x.items():
+                k = _key_norm(key)
+                if isinstance(value, bool):
+                    continue
+                try:
+                    iv = int(value)
+                except (TypeError, ValueError):
+                    iv = None
+                if iv is not None:
+                    if any(tok.replace("_", "") in k for tok in unresolved_tokens):
+                        out.setdefault("unresolved", iv)
+                    elif any(tok.replace("_", "") in k for tok in resolved_tokens):
+                        out.setdefault("resolved", iv)
+                    elif any(tok.replace("_", "") == k for tok in total_tokens):
+                        out.setdefault("total", iv)
+                if isinstance(value, (dict, list)):
+                    walk(value, depth + 1)
+        elif isinstance(x, list):
+            for item in x:
+                walk(item, depth + 1)
+    walk(obj)
+    return out
+
+
+def _unresolved_items_and_count(raw: dict[str, Any], violations: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int, dict[str, int]]:
+    unresolved = [v for v in violations if _is_unresolved_violation(v)]
+    counts = _find_count_fields(raw)
+    if "unresolved" in counts:
+        return unresolved, max(0, counts["unresolved"]), counts
+    if "total" in counts and "resolved" in counts:
+        return unresolved, max(0, counts["total"] - counts["resolved"]), counts
+    return unresolved, len(unresolved), counts
+
+
+def _build_violation_attributes(violation: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": first_value(violation, "violationId", "violationHistoryId", "vehicleViolationHistoryId", "idEncrypt", "id"),
+        "code": first_value(violation, "violationCode"),
+        "name": first_value(violation, "violationName", "violationTypeName", "violationReason"),
+        "date": first_value(violation, "violationDate", "violationAt", "violationTime"),
+        "address": first_value(violation, "violationAddress", "address"),
+        "detecting_unit": first_value(violation, "violationDetectingUnit"),
+        "handling_unit": first_value(violation, "violationHandlingUnit"),
+        "status": first_value(
+            violation,
+            "violationStatusName", "violationStatusCode", "statusName", "statusCode", "status",
+            "paymentStatusName", "paymentStatusCode", "paymentStatus", "processStatus", "handlingStatus",
+        ),
+        "raw": violation,
+    }

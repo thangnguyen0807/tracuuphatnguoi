@@ -215,9 +215,12 @@ class VNeTrafficSensor(CoordinatorEntity[VNeTrafficCoordinator], SensorEntity):
     def extra_state_attributes(self) -> dict[str, Any]:
         violations = self.coordinator.data.get("violations", []) if self.coordinator.data else []
         latest = [_build_violation_attributes(v) for v in violations]
-        unresolved, unresolved_count, summary_counts = _unresolved_items_and_count(
-            self.coordinator.data.get("raw", {}) if self.coordinator.data else {}, violations
-        )
+        raw = self.coordinator.data.get("raw", {}) if self.coordinator.data else {}
+        pending_rows = self.coordinator.data.get("pending_violations", []) if self.coordinator.data else []
+        unresolved, unresolved_count, summary_counts = _unresolved_items_and_count(raw, violations)
+        if pending_rows:
+            unresolved = pending_rows
+            unresolved_count = len(pending_rows)
         return {
             "license_plate": self.plate,
             "vehicle_type": self.vehicle_type,
@@ -228,6 +231,7 @@ class VNeTrafficSensor(CoordinatorEntity[VNeTrafficCoordinator], SensorEntity):
             "unresolved_violations": [_build_violation_attributes(v) for v in unresolved],
             "unresolved_status_debug": [_status_debug(v) for v in violations],
             "source": "VNeTraffic official citizen API",
+            "api_debug": self.coordinator.data.get("debug", {}) if self.coordinator.data else {},
         }
 
 
@@ -248,6 +252,9 @@ class VNeTrafficUnresolvedSensor(CoordinatorEntity[VNeTrafficCoordinator], Senso
     def native_value(self) -> int:
         violations = self.coordinator.data.get("violations", []) if self.coordinator.data else []
         raw = self.coordinator.data.get("raw", {}) if self.coordinator.data else {}
+        pending_rows = self.coordinator.data.get("pending_violations", []) if self.coordinator.data else []
+        if pending_rows:
+            return len(pending_rows)
         _unresolved, unresolved_count, _counts = _unresolved_items_and_count(raw, violations)
         return unresolved_count
 
@@ -256,6 +263,10 @@ class VNeTrafficUnresolvedSensor(CoordinatorEntity[VNeTrafficCoordinator], Senso
         violations = self.coordinator.data.get("violations", []) if self.coordinator.data else []
         raw = self.coordinator.data.get("raw", {}) if self.coordinator.data else {}
         unresolved_raw, unresolved_count, summary_counts = _unresolved_items_and_count(raw, violations)
+        pending_rows = self.coordinator.data.get("pending_violations", []) if self.coordinator.data else []
+        if pending_rows:
+            unresolved_raw = pending_rows
+            unresolved_count = len(pending_rows)
         unresolved = [_build_violation_attributes(v) for v in unresolved_raw]
         return {
             "license_plate": self.plate,
@@ -265,4 +276,5 @@ class VNeTrafficUnresolvedSensor(CoordinatorEntity[VNeTrafficCoordinator], Senso
             "violations": unresolved,
             "status_debug": [_status_debug(v) for v in violations],
             "source": "VNeTraffic official citizen API",
+            "api_debug": self.coordinator.data.get("debug", {}) if self.coordinator.data else {},
         }

@@ -24,7 +24,11 @@ class VNeTrafficCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             result = await self.api.lookup(self.license_plate)
         except VNeTrafficError as err:
             raise UpdateFailed(str(err)) from err
+        raw = result.raw
+        pending_rows = raw.get("_pending_fine_rows_for_plate", []) if isinstance(raw, dict) else []
         return {
-            "raw": result.raw,
+            "raw": raw,
             "violations": result.violations,
+            "pending_violations": pending_rows,
+            "debug": result.debug,
         }
