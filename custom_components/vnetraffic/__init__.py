@@ -8,17 +8,29 @@ from .const import CONF_LICENSE_PLATE, CONF_PASSWORD, CONF_SCAN_INTERVAL, CONF_U
 from .coordinator import VNeTrafficCoordinator
 
 PLATFORMS = ["sensor"]
+_ACCOUNTS_KEY = "_accounts"
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     from .api import VNeTrafficApi
 
     session = async_get_clientsession(hass)
-    api = VNeTrafficApi(
-        session,
-        username=entry.data[CONF_USERNAME],
-        password=entry.data[CONF_PASSWORD],
-    )
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    accounts = domain_data.setdefault(_ACCOUNTS_KEY, {})
+    account_key = entry.data[CONF_USERNAME].strip().lower()
+    account = accounts.get(account_key)
+    if account is None:
+        api = VNeTrafficApi(
+            session,
+            username=entry.data[CONF_USERNAME],
+            password=entry.data[CONF_PASSWORD],
+        )
+        account = {"api": api, "refs": 0}
+        accounts[account_key] = account
+    else:
+        api = account["api"]
+    account["refs"] += 1
+
     coordinator = VNeTrafficCoordinator(
         hass,
         api,
@@ -34,5 +46,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
-        hass.data[DOMAIN].pop(entry.entry_id, None)
+        domain_data = hass.data.get(DOMAIN, {})
+        domain_data.pop(entry.entry_id, None)
+        accounts = domain_data.get(_ACCOUNTS_KEY, {})
+        account_key = entry.data.get(CONF_USERNAME, "").strip().lower()
+        account = accounts.get(account_key)
+        if account:
+            account["refs"] = max(0, int(account.get("refs", 1)) - 1)
+            if account["refs"] == 0:
+                accounts.pop(account_key, None)
     return unload_ok

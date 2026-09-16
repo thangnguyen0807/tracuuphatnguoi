@@ -6,6 +6,7 @@ import json
 import uuid
 import base64
 import os
+import asyncio
 
 import aiohttp
 from cryptography.hazmat.primitives import serialization
@@ -48,6 +49,7 @@ class VNeTrafficApi:
         self.device_id = _stable_device_id(self.username)
         self._public_key: str | None = None
         self._remote_config_loaded = False
+        self._login_lock = asyncio.Lock()
 
     def _headers(self, authenticated: bool = False, include_app_headers: bool = True) -> dict[str, str]:
         headers: dict[str, str] = {
@@ -152,8 +154,11 @@ class VNeTrafficApi:
         return True
 
     async def _ensure_authenticated(self) -> None:
-        if not self.access_token:
-            await self.login()
+        if self.access_token:
+            return
+        async with self._login_lock:
+            if not self.access_token:
+                await self.login()
 
     async def lookup(self, license_plate: str) -> LookupResult:
         plate = normalize_plate(license_plate)
@@ -285,9 +290,16 @@ def _api_message(text: str) -> str:
 
 
 def extract_violations(data: Any) -> list[dict[str, Any]]:
+    """Extract violation records from the API's nested/paginated response.
+
+    The Android client maps the history response into DTOs whose field names vary
+    slightly across backend revisions. Accept both the known violation-prefixed
+    fields and the generic record shape used by paginated responses.
+    """
     found: list[dict[str, Any]] = []
+
     def walk(obj: Any, depth: int = 0) -> None:
-        if depth > 8:
+        if depth > 12:
             return
         if isinstance(obj, dict):
             if looks_like_violation(obj):
@@ -297,11 +309,16 @@ def extract_violations(data: Any) -> list[dict[str, Any]]:
         elif isinstance(obj, list):
             for item in obj:
                 walk(item, depth + 1)
+
     walk(data)
+
     unique: list[dict[str, Any]] = []
     seen: set[str] = set()
     for item in found:
-        key = str(item.get("violationId") or item.get("violationHistoryId") or json.dumps(item, sort_keys=True, ensure_ascii=False))
+        key = (
+            str(find_first(item, "violationHistoryId", "vehicleViolationHistoryId", "violationId", "idEncrypt", "id"))
+            or json.dumps(item, sort_keys=True, ensure_ascii=False)
+        )
         if key not in seen:
             seen.add(key)
             unique.append(item)
@@ -310,7 +327,31 @@ def extract_violations(data: Any) -> list[dict[str, Any]]:
 
 def looks_like_violation(item: dict[str, Any]) -> bool:
     keys = {str(k).lower() for k in item}
-    return bool(keys & {
-        "violationid", "violationhistoryid", "violationname", "violationcode",
-        "violationaddress", "violationdate", "violationstatuscode",
-    })
+
+    # Exact fields observed in VNeTraffic's violation DTOs.
+    if keys & {
+        "violationid", "violationhistoryid", "vehicleviolationhistoryid",
+        "violationname", "violationcode", "violationaddress",
+        "violationdate", "violationat", "violationtime",
+        "violationstatuscode", "violationstatusname", "violationtypename",
+    }:
+        return True
+
+    # Backend revisions may expose a generic record with plate + time/type/status.
+    generic = {
+        "licenseplate", "licenseplateencrypt", "plate",
+        "violationtype", "violationreason", "violationattext",
+        "violationdatetext", "violationtimetext", "address",
+        "status", "statuscode", "statusname",
+    }
+    score = len(keys & generic)
+    if score >= 2 and ("id" in keys or "violationtype" in keys or "violationreason" in keys):
+        return True
+
+    # Some paginated APIs return records with only id + date + amount/status.
+    time_keys = {"date", "createdat", "updatedat", "violationdate", "violationat", "violationtime"}
+    money_keys = {"penalty", "penaltyamount", "fineamount", "amount", "money"}
+    if "id" in keys and (keys & time_keys) and (keys & money_keys or keys & {"status", "statuscode", "statusname"}):
+        return True
+
+    return False
