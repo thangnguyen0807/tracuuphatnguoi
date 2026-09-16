@@ -2,15 +2,6 @@
 
 Home Assistant custom integration for querying traffic violation (phạt nguội) history from the official VNeTraffic citizen API.
 
-## v0.2.1
-
-- Removed the manual **Access Token** field.
-- Login uses the same basic flow as the VNeTraffic Android app: **username + password**.
-- The integration calls `/auth/logins` and keeps the returned access/refresh tokens internally.
-- When the access token expires, it tries `/auth/refresh-token`; if refresh fails it logs in again.
-- Traffic violation lookup uses `/property/vehicle-violation/history` with `licensePlate`.
-- Credentials are stored in the Home Assistant config entry; tokens are not exposed as configuration fields.
-
 ## Installation
 
 ### HACS
@@ -22,21 +13,6 @@ Home Assistant custom integration for querying traffic violation (phạt nguội
 
 ### Important
 The APK is not included in this repository. The integration was implemented from the API behavior recovered from the official VNeTraffic Android APK.
-
-## API
-Official citizen API base URL recovered from the APK:
-
-`https://citizen-api.vnetraffic.gov.vn/`
-
-Authentication endpoints recovered from the APK:
-
-- `POST /auth/logins`
-- `POST /auth/refresh-token`
-
-Violation endpoint:
-
-- `GET /property/vehicle-violation/history`
-- Query: `licensePlate`
 
 ## Home Assistant entity
 
