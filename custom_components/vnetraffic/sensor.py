@@ -5,7 +5,7 @@ from typing import Any
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .api import first_value
+from .api import first_value, _status_debug
 
 
 def _status_values(violation: dict[str, Any]) -> list[tuple[str, Any]]:
@@ -181,6 +181,16 @@ from .const import DOMAIN, NAME, CONF_LICENSE_PLATE, CONF_VEHICLE_TYPE
 from .coordinator import VNeTrafficCoordinator
 
 
+def _server_count(data: dict[str, Any] | None, key: str) -> int | None:
+    if not isinstance(data, dict):
+        return None
+    for container_key in ("_history_counts", "_deferred_fine_counts", "_pending_fine_counts", "_dashboard_violations_counts"):
+        counts = data.get(container_key)
+        if isinstance(counts, dict) and isinstance(counts.get(key), int):
+            return max(0, counts[key])
+    return None
+
+
 async def async_setup_entry(hass, entry, async_add_entities):
     coordinator: VNeTrafficCoordinator = hass.data[DOMAIN][entry.entry_id]
     async_add_entities(
@@ -199,13 +209,18 @@ class VNeTrafficSensor(CoordinatorEntity[VNeTrafficCoordinator], SensorEntity):
     def __init__(self, coordinator, config):
         super().__init__(coordinator)
         self._attr_unique_id = f"{DOMAIN}_{config[CONF_LICENSE_PLATE].replace(' ', '').lower()}"
-        self._attr_name = "Phạt nguội"
+        self._attr_name = "Số lần vi phạm"
         self.plate = config[CONF_LICENSE_PLATE]
         self.vehicle_type = config.get(CONF_VEHICLE_TYPE, "auto")
 
     @property
     def native_value(self) -> int:
-        return len(self.coordinator.data.get("violations", [])) if self.coordinator.data else 0
+        data = self.coordinator.data or {}
+        rows = data.get("violations", [])
+        server_total = _server_count(data, "total")
+        if server_total is not None and (server_total > 0 or not rows):
+            return server_total
+        return len(rows)
 
     @property
     def native_unit_of_measurement(self) -> str:
@@ -218,13 +233,16 @@ class VNeTrafficSensor(CoordinatorEntity[VNeTrafficCoordinator], SensorEntity):
         raw = self.coordinator.data.get("raw", {}) if self.coordinator.data else {}
         pending_rows = self.coordinator.data.get("pending_violations", []) if self.coordinator.data else []
         unresolved, unresolved_count, summary_counts = _unresolved_items_and_count(raw, violations)
+        deferred_total = _server_count(self.coordinator.data, "deferred_total")
         if pending_rows:
             unresolved = pending_rows
-            unresolved_count = len(pending_rows)
+            unresolved_count = deferred_total if deferred_total is not None else len(pending_rows)
+        elif deferred_total is not None:
+            unresolved_count = deferred_total
         return {
             "license_plate": self.plate,
             "vehicle_type": self.vehicle_type,
-            "violation_count": len(latest),
+            "violation_count": _server_count(self.coordinator.data, "total") if _server_count(self.coordinator.data, "total") is not None else len(latest),
             "unresolved_violation_count": unresolved_count,
             "server_violation_counts": summary_counts,
             "violations": latest,
@@ -244,17 +262,21 @@ class VNeTrafficUnresolvedSensor(CoordinatorEntity[VNeTrafficCoordinator], Senso
         super().__init__(coordinator)
         plate = config[CONF_LICENSE_PLATE].replace(" ", "").lower()
         self._attr_unique_id = f"{DOMAIN}_{plate}_unresolved"
-        self._attr_name = "Vi phạm chưa xử lý"
+        self._attr_name = "Số lần phạt nguội"
         self.plate = config[CONF_LICENSE_PLATE]
         self.vehicle_type = config.get(CONF_VEHICLE_TYPE, "auto")
 
     @property
     def native_value(self) -> int:
-        violations = self.coordinator.data.get("violations", []) if self.coordinator.data else []
-        raw = self.coordinator.data.get("raw", {}) if self.coordinator.data else {}
-        pending_rows = self.coordinator.data.get("pending_violations", []) if self.coordinator.data else []
+        data = self.coordinator.data or {}
+        pending_rows = data.get("pending_violations", [])
+        deferred_total = _server_count(data, "deferred_total")
+        if deferred_total is not None:
+            return deferred_total
         if pending_rows:
             return len(pending_rows)
+        violations = data.get("violations", [])
+        raw = data.get("raw", {})
         _unresolved, unresolved_count, _counts = _unresolved_items_and_count(raw, violations)
         return unresolved_count
 
@@ -264,14 +286,18 @@ class VNeTrafficUnresolvedSensor(CoordinatorEntity[VNeTrafficCoordinator], Senso
         raw = self.coordinator.data.get("raw", {}) if self.coordinator.data else {}
         unresolved_raw, unresolved_count, summary_counts = _unresolved_items_and_count(raw, violations)
         pending_rows = self.coordinator.data.get("pending_violations", []) if self.coordinator.data else []
+        deferred_total = _server_count(self.coordinator.data, "deferred_total")
         if pending_rows:
             unresolved_raw = pending_rows
-            unresolved_count = len(pending_rows)
+            unresolved_count = deferred_total if deferred_total is not None else len(pending_rows)
+        elif deferred_total is not None:
+            unresolved_count = deferred_total
         unresolved = [_build_violation_attributes(v) for v in unresolved_raw]
         return {
             "license_plate": self.plate,
             "vehicle_type": self.vehicle_type,
             "violation_count": unresolved_count,
+            "deferred_fine_count": deferred_total,
             "server_violation_counts": summary_counts,
             "violations": unresolved,
             "status_debug": [_status_debug(v) for v in violations],

@@ -25,7 +25,7 @@ class VNeTrafficCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except VNeTrafficError as err:
             raise UpdateFailed(str(err)) from err
         raw = result.raw
-        pending_rows = raw.get("_pending_fine_rows_for_plate", []) if isinstance(raw, dict) else []
+        pending_rows = raw.get("_deferred_fine_rows_for_plate", []) if isinstance(raw, dict) else []
         return {
             "raw": raw,
             "violations": result.violations,

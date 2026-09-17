@@ -1,7 +1,7 @@
 {
   "domain": "vnetraffic",
   "name": "VNeTraffic",
-  "version": "0.5.3",
+  "version": "0.5.6",
   "documentation": "https://github.com/thangnguyen0807/vnetraffic-hass",
   "issue_tracker": "https://github.com/thangnguyen0807/vnetraffic-hass/issues",
   "codeowners": [

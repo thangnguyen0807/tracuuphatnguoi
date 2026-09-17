@@ -72,6 +72,10 @@ class VNeTrafficApi:
         if include_app_headers:
             headers["Device-Id"] = self.device_id
             headers["Device-Info"] = _device_info()
+        if authenticated:
+            # Present in the APK's authenticated header builder; empty is valid
+            # when there is no active passcode token.
+            headers["X-PASSCODE-TOKEN"] = ""
         if authenticated and self.access_token:
             token = self.access_token
             headers["Authorization"] = token if token.lower().startswith("bearer ") else f"Bearer {token}"
@@ -174,13 +178,15 @@ class VNeTrafficApi:
         await self._load_remote_config()
 
         debug_requests: list[dict[str, Any]] = []
-        data: dict[str, Any] = {}
-        http_status = 0
-        raw_text_snapshot = ""
-        last_error: str | None = None
+        history_data: Any = None
+        deferred_data: Any = None
+        history_text = ""
+        deferred_text = ""
+        history_status = 0
+        deferred_status = 0
 
         async def get_json(path: str, params: list[tuple[str, str]] | None = None) -> tuple[int, Any, str]:
-            url = f"{self.base_url}/{path.lstrip('/')}"
+            url = f"{self.base_url}/{path.lstrip('/') }"
             try:
                 async with self.session.get(
                     url,
@@ -197,112 +203,82 @@ class VNeTrafficApi:
             except aiohttp.ClientError as err:
                 raise VNeTrafficError(f"Không kết nối được VNeTraffic API: {err}") from err
 
-        # The APK exposes a dedicated pending-fine resource. Use it directly for
-        # unresolved violations instead of guessing status codes on history.
-        pending_url = f"{self.base_url}/property/pending/fine"
-        status, pending_data, pending_text = await get_json("property/pending/fine")
+        vehicle_code = _vehicle_type_code(self._vehicle_type)
+
+        # EXACT APK search flow: ViolationViewModel -> ViolationRepository.a ->
+        # ViolationService.b -> GET {root}/property/deferred/fines.
+        deferred_params = [("licensePlate", plate), ("type", vehicle_code)]
+        deferred_status, deferred_data, deferred_text = await get_json(
+            "property/deferred/fines", deferred_params
+        )
+        deferred_rows = extract_httpdata_rows(deferred_data)
+        deferred_counts = _find_count_fields(deferred_data)
+        deferred_total = _meta_total(deferred_data)
+        if deferred_total is not None:
+            deferred_counts["deferred_total"] = deferred_total
         debug_requests.append({
-            "endpoint": "/pending/fine",
-            "params": [],
-            "http_status": status,
-            "extracted_count": len(extract_violations(pending_data)),
-            "server_total": _find_count_fields(pending_data).get("total") if isinstance(pending_data, (dict, list)) else None,
-            "response_preview": pending_text[:1600],
+            "endpoint": "/property/deferred/fines",
+            "params": deferred_params,
+            "http_status": deferred_status,
+            "extracted_count": len(deferred_rows),
+            "server_total": deferred_total,
+            "response_preview": deferred_text[:1600],
         })
 
-        pending_rows = extract_violations(pending_data) if pending_data is not None else []
-        pending_plate_rows = [
-            row for row in pending_rows
-            if normalize_plate(str(find_first(row, "licensePlate", "licensePlateEncrypt", "plate", "vehiclePlate") or "")) == plate
-        ]
-
-        # APK SearchViolation call-site: repository.c(e, c, d, selectedItem.getText(), r)
-        # maps to query params in this order:
-        # violationStatusCode, timeRange, timeRange, licensePlate, keySearch.
-        # `selectedItem.getText()` is the selected vehicle label (not the plate);
-        # the typed/search plate is `r`.  The APK's default lookup window is the
-        # current instant minus one Calendar month through the current instant,
-        # and convertToUTCString() formats both values as UTC
-        # ``yyyy-MM-dd'T'HH:mm:ss'Z'``.
-        history_url = f"{self.base_url}/property/vehicle-violation/history"
+        # Separate history call: exact APK ViolationService.d() contract.
         history_params = _build_history_params(plate, self._vehicle_type, dt_util.now())
-        status, history_data, history_text = await get_json(
+        history_status, history_data, history_text = await get_json(
             "property/vehicle-violation/history", history_params
         )
-        http_status = status
-        raw_text_snapshot = history_text[:4000]
-        history_rows = extract_violations(history_data)
-        server_total = _find_count_fields(history_data).get("total") if isinstance(history_data, (dict, list)) else None
+        history_rows = extract_httpdata_rows(history_data)
+        history_counts = _find_count_fields(history_data)
+        history_total = _meta_total(history_data)
+        if history_total is not None:
+            history_counts["total"] = history_total
         debug_requests.append({
             "endpoint": "/property/vehicle-violation/history",
             "params": history_params,
-            "http_status": status,
+            "http_status": history_status,
             "extracted_count": len(history_rows),
-            "server_total": server_total,
+            "server_total": history_total,
             "response_preview": history_text[:1600],
         })
 
-        # The APK also exposes the dashboard violations resource. It is useful as
-        # a count/aggregate fallback when vehicle history is not populated for the
-        # logged-in account. Do one deterministic request only.
-        dashboard_url = f"{self.base_url}/property/dashboard/violations"
-        d_status, dashboard_data, dashboard_text = await get_json("property/dashboard/violations")
-        dashboard_rows = extract_violations(dashboard_data) if dashboard_data is not None else []
-        dashboard_total = _find_count_fields(dashboard_data).get("total") if isinstance(dashboard_data, (dict, list)) else None
-        debug_requests.append({
-            "endpoint": "/property/dashboard/violations",
-            "params": [],
-            "http_status": d_status,
-            "extracted_count": len(dashboard_rows),
-            "server_total": dashboard_total,
-            "response_preview": dashboard_text[:1600],
-        })
-
-        # Prefer history rows for the complete violation list. If that endpoint is
-        # empty but pending/fine contains rows for this plate, expose those rows so
-        # the unresolved counter still reflects the official pending resource.
-        violations = history_rows if history_rows else pending_plate_rows
-        if not violations and dashboard_rows:
-            violations = [
-                row for row in dashboard_rows
-                if normalize_plate(str(find_first(row, "licensePlate", "licensePlateEncrypt", "plate", "vehiclePlate") or "")) == plate
-            ] or dashboard_rows
-        data = history_data if isinstance(history_data, dict) else {}
-        if pending_data is not None:
-            data = dict(data)
-            data["_pending_fine"] = pending_data
-            data["_pending_fine_rows_for_plate"] = pending_plate_rows
-        if dashboard_data is not None:
-            data = dict(data)
-            data["_dashboard_violations"] = dashboard_data
-            data["_dashboard_violations_rows"] = dashboard_rows
-
-        if status >= 400:
-            last_error = f"HTTP {status}: {_api_message(history_text)}"
-        if history_rows:
-            data["_effective_violation_source"] = "property/vehicle-violation/history:keySearch"
-        elif status == 200 and not history_rows and pending_plate_rows:
-            data["_effective_violation_source"] = "property/pending/fine"
-        else:
-            data["_effective_violation_source"] = "none"
+        data: dict[str, Any] = {
+            "history_response": history_data,
+            "deferred_fines_response": deferred_data,
+            "_history_counts": history_counts,
+            "_deferred_fine_counts": deferred_counts,
+            "_deferred_fine_rows_for_plate": deferred_rows,
+            "_effective_violation_source": "property/vehicle-violation/history",
+            "_deferred_fine_effective_source": "property/deferred/fines" if deferred_rows else "none",
+        }
+        # Keep history as the violation list; deferred/fines is the dedicated
+        # unresolved/fine list exposed separately by the coordinator.
+        violations = history_rows
+        http_status = history_status or deferred_status
+        raw_text_snapshot = history_text[:4000] if history_text else deferred_text[:4000]
+        last_error = None
+        if history_status >= 400 and deferred_status >= 400:
+            last_error = f"History HTTP {history_status}; deferred/fines HTTP {deferred_status}"
 
         debug = build_response_debug(
             data=data,
             text=raw_text_snapshot,
             http_status=http_status,
-            url=history_url,
+            url=f"{self.base_url}/property/vehicle-violation/history",
             plate=plate,
             violations=violations,
         )
-        debug["pending_fine_url"] = pending_url
-        debug["pending_fine_rows_for_plate"] = len(pending_plate_rows)
-        debug["dashboard_violations_url"] = dashboard_url
-        debug["dashboard_violations_rows"] = len(dashboard_rows)
-        debug["history_rows"] = len(history_rows)
         debug["request_profiles"] = debug_requests
+        debug["history_total"] = history_total
+        debug["deferred_fine_total"] = deferred_total
+        debug["deferred_fine_rows"] = len(deferred_rows)
+        debug["vehicle_type_code"] = vehicle_code
         if last_error:
             debug["last_error"] = last_error
         return LookupResult(raw=data, violations=violations, debug=debug)
+
 
 
 def encrypt_apk_payload(payload: dict[str, Any], public_key_pem: str) -> tuple[str, str]:
@@ -329,20 +305,47 @@ def encrypt_apk_payload(payload: dict[str, Any], public_key_pem: str) -> tuple[s
     client_secret = base64.b64encode(wrapped).decode("ascii")
     return payload_b64, client_secret
 
+def _vehicle_type_code(vehicle_type: str) -> str:
+    return {
+        "auto": "1",
+        "motorcycle": "2",
+        "other": "3",
+    }.get(vehicle_type or "auto", "1")
+
+
+def _meta_total(data: Any) -> int | None:
+    if not isinstance(data, dict):
+        return None
+    meta = data.get("meta")
+    if isinstance(meta, dict):
+        try:
+            return max(0, int(meta.get("total")))
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def extract_httpdata_rows(data: Any) -> list[dict[str, Any]]:
+    data = _flatten_embedded_json(data)
+    if isinstance(data, dict):
+        rows = data.get("data")
+        if isinstance(rows, list):
+            return [row for row in rows if isinstance(row, dict)]
+        nested = data.get("result")
+        if isinstance(nested, dict) and isinstance(nested.get("data"), list):
+            return [row for row in nested["data"] if isinstance(row, dict)]
+    return []
+
+
 def _build_history_params(plate: str, vehicle_type: str, now_local: datetime) -> list[tuple[str, str]]:
     """Build the exact five @Query values used by ViolationService.d()."""
-    vehicle_label = {
-        # Exact strings recovered from SelectionItem construction in the APK.
-        "auto": "Ôtô",
-        "motorcycle": "Mô tô",
-        "other": "Xe đạp điện",
-    }.get(vehicle_type or "auto", "Ôtô")
+    vehicle_code = _vehicle_type_code(vehicle_type)
     start_local = _calendar_add_months(now_local, -1)
     return [
         ("violationStatusCode", ""),
         ("timeRange", _format_apk_utc(start_local)),
         ("timeRange", _format_apk_utc(now_local)),
-        ("licensePlate", vehicle_label),
+        ("licensePlate", vehicle_code),
         ("keySearch", plate),
     ]
 
@@ -680,7 +683,8 @@ def _find_count_fields(obj: Any) -> dict[str, int]:
     out: dict[str, int] = {}
     unresolved_tokens = (
         "unresolved", "unprocessed", "unhandled", "pending", "unpaid",
-        "notprocessed", "not_processed", "notpaid", "not_paid",
+        "pendingcount", "unresolvedcount", "unprocessedcount", "unhandledcount",
+        "notprocessed", "notprocessedcount", "notpaid", "notpaidcount",
         "chua_xu_phat", "chuaxuphat", "chua_xu_ly", "chuaxuly",
         "chua_nop_phat", "chuanopphat", "chua_thanh_toan", "chuathanhtoan",
     )
@@ -688,7 +692,10 @@ def _find_count_fields(obj: Any) -> dict[str, int]:
         "resolved", "processed", "handled", "paid", "settled", "completed",
         "processedviolations", "paidviolations", "handledviolations",
     )
-    total_tokens = ("totalviolations", "violationcount", "totalviolationcount", "total")
+    total_tokens = (
+        "totalviolations", "violationcount", "totalviolationcount", "total",
+        "totalelements", "totalcount", "count", "numberofelements",
+    )
 
     def walk(x: Any, depth: int = 0) -> None:
         if depth > 10:
