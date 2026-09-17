@@ -30,8 +30,5 @@ class VNeTrafficCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "raw": raw,
             "violations": result.violations,
             "pending_violations": pending_rows,
-            "total_violation_count": int(raw.get("_total_violation_count", len(result.violations))) if isinstance(raw, dict) else len(result.violations),
-            "processed_violation_count": int(raw.get("_processed_violation_count", 0)) if isinstance(raw, dict) else 0,
-            "unresolved_violation_count": int(raw.get("_unresolved_violation_count", len(pending_rows))) if isinstance(raw, dict) else len(pending_rows),
             "debug": result.debug,
         }
