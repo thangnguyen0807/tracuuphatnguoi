@@ -4,7 +4,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .const import CONF_LICENSE_PLATE, CONF_PASSWORD, CONF_SCAN_INTERVAL, CONF_USERNAME, DOMAIN
+from .const import CONF_LICENSE_PLATE, CONF_PASSWORD, CONF_SCAN_INTERVAL, CONF_USERNAME, CONF_VEHICLE_TYPE, DOMAIN
 from .coordinator import VNeTrafficCoordinator
 
 PLATFORMS = ["sensor"]
@@ -24,6 +24,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             session,
             username=entry.data[CONF_USERNAME],
             password=entry.data[CONF_PASSWORD],
+            vehicle_type=entry.data.get(CONF_VEHICLE_TYPE, "auto"),
         )
         account = {"api": api, "refs": 0}
         accounts[account_key] = account

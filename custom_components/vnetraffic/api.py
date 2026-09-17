@@ -7,6 +7,9 @@ import uuid
 import base64
 import os
 import asyncio
+from datetime import datetime, timedelta, timezone
+
+from homeassistant.util import dt as dt_util
 
 import aiohttp
 from cryptography.hazmat.primitives import serialization
@@ -40,10 +43,11 @@ class LookupResult:
 class VNeTrafficApi:
     """Client matching the official VNeTraffic Android API flow."""
 
-    def __init__(self, session: aiohttp.ClientSession, username: str, password: str, base_url: str = DEFAULT_BASE_URL) -> None:
+    def __init__(self, session: aiohttp.ClientSession, username: str, password: str, base_url: str = DEFAULT_BASE_URL, vehicle_type: str = "auto") -> None:
         self.session = session
         self.username = username.strip()
         self.password = password
+        self._vehicle_type = vehicle_type or "auto"
         self.base_url = _normalize_api_base_url(base_url)
         self.access_token: str | None = None
         self.refresh_token: str | None = None
@@ -67,7 +71,7 @@ class VNeTrafficApi:
         # Keep the login request close to the APK's base header.
         if include_app_headers:
             headers["Device-Id"] = self.device_id
-            headers["Device-Info"] = "Home Assistant"
+            headers["Device-Info"] = _device_info()
         if authenticated and self.access_token:
             token = self.access_token
             headers["Authorization"] = token if token.lower().startswith("bearer ") else f"Bearer {token}"
@@ -212,10 +216,16 @@ class VNeTrafficApi:
             if normalize_plate(str(find_first(row, "licensePlate", "licensePlateEncrypt", "plate", "vehiclePlate") or "")) == plate
         ]
 
-        # Main history request: one clean request only. The previous versions sent
-        # dozens of speculative requests, which triggered the upstream WAF.
+        # APK SearchViolation call-site: repository.c(e, c, d, selectedItem.getText(), r)
+        # maps to query params in this order:
+        # violationStatusCode, timeRange, timeRange, licensePlate, keySearch.
+        # `selectedItem.getText()` is the selected vehicle label (not the plate);
+        # the typed/search plate is `r`.  The APK's default lookup window is the
+        # current instant minus one Calendar month through the current instant,
+        # and convertToUTCString() formats both values as UTC
+        # ``yyyy-MM-dd'T'HH:mm:ss'Z'``.
         history_url = f"{self.base_url}/property/vehicle-violation/history"
-        history_params = [("licensePlate", plate)]
+        history_params = _build_history_params(plate, self._vehicle_type, dt_util.now())
         status, history_data, history_text = await get_json(
             "property/vehicle-violation/history", history_params
         )
@@ -269,9 +279,11 @@ class VNeTrafficApi:
 
         if status >= 400:
             last_error = f"HTTP {status}: {_api_message(history_text)}"
-        if status == 200 and not history_rows and pending_plate_rows:
+        if history_rows:
+            data["_effective_violation_source"] = "property/vehicle-violation/history:keySearch"
+        elif status == 200 and not history_rows and pending_plate_rows:
             data["_effective_violation_source"] = "property/pending/fine"
-        elif not history_rows:
+        else:
             data["_effective_violation_source"] = "none"
 
         debug = build_response_debug(
@@ -316,6 +328,51 @@ def encrypt_apk_payload(payload: dict[str, Any], public_key_pem: str) -> tuple[s
     )
     client_secret = base64.b64encode(wrapped).decode("ascii")
     return payload_b64, client_secret
+
+def _build_history_params(plate: str, vehicle_type: str, now_local: datetime) -> list[tuple[str, str]]:
+    """Build the exact five @Query values used by ViolationService.d()."""
+    vehicle_label = {
+        # Exact strings recovered from SelectionItem construction in the APK.
+        "auto": "Ôtô",
+        "motorcycle": "Mô tô",
+        "other": "Xe đạp điện",
+    }.get(vehicle_type or "auto", "Ôtô")
+    start_local = _calendar_add_months(now_local, -1)
+    return [
+        ("violationStatusCode", ""),
+        ("timeRange", _format_apk_utc(start_local)),
+        ("timeRange", _format_apk_utc(now_local)),
+        ("licensePlate", vehicle_label),
+        ("keySearch", plate),
+    ]
+
+
+def _calendar_add_months(value: datetime, months: int) -> datetime:
+    """Match java.util.Calendar.add(Calendar.MONTH, months) for HA timestamps."""
+    year = value.year + (value.month - 1 + months) // 12
+    month = (value.month - 1 + months) % 12 + 1
+
+    # Java Calendar clamps an overflowing day to the last valid day of target month.
+    if month == 12:
+        next_month = datetime(year + 1, 1, 1, tzinfo=value.tzinfo)
+    else:
+        next_month = datetime(year, month + 1, 1, tzinfo=value.tzinfo)
+    last_day = (next_month - timedelta(days=1)).day
+    return value.replace(year=year, month=month, day=min(value.day, last_day))
+
+
+def _format_apk_utc(value: datetime) -> str:
+    """Match BaseAppUtils.convertToUTCString(Calendar): UTC, second precision, Z suffix."""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=dt_util.DEFAULT_TIME_ZONE)
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _device_info() -> str:
+    """Keep the APK's `MANUFACTURER - MODEL - RELEASE` shape for server compatibility."""
+    import platform
+    return f"Home Assistant - {platform.machine()} - {platform.release()}"
+
 
 def _normalize_api_base_url(value: str) -> str:
     """Return the effective API root reconstructed from the APK.
