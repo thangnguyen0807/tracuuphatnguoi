@@ -205,62 +205,153 @@ class VNeTrafficApi:
 
         vehicle_code = _vehicle_type_code(self._vehicle_type)
 
-        # EXACT APK search flow: ViolationViewModel -> ViolationRepository.a ->
-        # ViolationService.b -> GET {root}/property/deferred/fines.
+        # EXACT v0.5.6 source for unresolved violations.
         deferred_params = [("licensePlate", plate), ("type", vehicle_code)]
         deferred_status, deferred_data, deferred_text = await get_json(
             "property/deferred/fines", deferred_params
         )
         deferred_rows = extract_httpdata_rows(deferred_data)
+        if not deferred_rows and deferred_data is not None:
+            deferred_rows = extract_violations(deferred_data)
         deferred_counts = _find_count_fields(deferred_data)
-        deferred_total = _meta_total(deferred_data)
+        deferred_meta_total = _meta_total(deferred_data)
+        deferred_total = _effective_count(
+            deferred_meta_total if deferred_meta_total is not None else deferred_counts.get("total"),
+            deferred_rows,
+        )
+        if deferred_counts.get("unresolved") is not None:
+            deferred_total = max(int(deferred_total or 0), int(deferred_counts["unresolved"]))
         if deferred_total is not None:
             deferred_counts["deferred_total"] = deferred_total
         debug_requests.append({
             "endpoint": "/property/deferred/fines",
+            "profile": "v0.5.6-exact",
             "params": deferred_params,
             "http_status": deferred_status,
             "extracted_count": len(deferred_rows),
-            "server_total": deferred_total,
+            "server_total": deferred_meta_total,
+            "effective_total": deferred_total,
             "response_preview": deferred_text[:1600],
         })
 
-        # Separate history call: exact APK ViolationService.d() contract.
+        # EXACT v0.5.6 history query.
         history_params = _build_history_params(plate, self._vehicle_type, dt_util.now())
         history_status, history_data, history_text = await get_json(
             "property/vehicle-violation/history", history_params
         )
         history_rows = extract_httpdata_rows(history_data)
+        if not history_rows and history_data is not None:
+            history_rows = extract_violations(history_data)
         history_counts = _find_count_fields(history_data)
-        history_total = _meta_total(history_data)
+        history_meta_total = _meta_total(history_data)
+        history_total = _effective_count(
+            history_meta_total if history_meta_total is not None else history_counts.get("total"),
+            history_rows,
+        )
         if history_total is not None:
             history_counts["total"] = history_total
         debug_requests.append({
             "endpoint": "/property/vehicle-violation/history",
+            "profile": "v0.5.6-exact",
             "params": history_params,
             "http_status": history_status,
             "extracted_count": len(history_rows),
-            "server_total": history_total,
+            "server_total": history_meta_total,
+            "effective_total": history_total,
             "response_preview": history_text[:1600],
         })
 
+        # APK search-screen contract used by earlier VNeTraffic builds.
+        # Only call it when the exact v0.5.6 history request returned no rows
+        # and no positive count, so normal operation remains on the v0.5.6 path.
+        search_rows: list[dict[str, Any]] = []
+        search_data: Any = None
+        search_text = ""
+        search_status = 0
+        search_total: int | None = None
+        if not history_rows and not (history_total and history_total > 0):
+            search_params = [
+                ("violationStatusCode", ""),
+                ("timeRange", ""),
+                ("timeRange", ""),
+                ("licensePlate", _vehicle_type_label(self._vehicle_type)),
+                ("keySearch", plate),
+            ]
+            search_status, search_data, search_text = await get_json(
+                "property/vehicle-violation/history", search_params
+            )
+            search_rows = extract_httpdata_rows(search_data)
+            if not search_rows and search_data is not None:
+                search_rows = extract_violations(search_data)
+            search_counts = _find_count_fields(search_data)
+            search_total = _effective_count(
+                _meta_total(search_data) if _meta_total(search_data) is not None else search_counts.get("total"),
+                search_rows,
+            )
+            if search_counts.get("resolved") is not None:
+                search_total = max(int(search_total or 0), int(search_counts["resolved"]))
+            debug_requests.append({
+                "endpoint": "/property/vehicle-violation/history",
+                "profile": "apk-search-fallback",
+                "params": search_params,
+                "http_status": search_status,
+                "extracted_count": len(search_rows),
+                "server_total": _meta_total(search_data),
+                "effective_total": search_total,
+                "response_preview": search_text[:1600],
+            })
+
+        effective_history_rows = history_rows if history_rows else search_rows
+        effective_history_total = history_total if history_total is not None else search_total
+
+        # The backend can legitimately return meta.total=0 while still returning
+        # rows. Therefore all effective totals are based on max(server_total, rows).
+        unresolved_count = max(
+            int(deferred_total or 0),
+            len(deferred_rows),
+            int(deferred_counts.get("unresolved", 0) or 0),
+        )
+        total_candidates = [
+            len(effective_history_rows),
+            int(effective_history_total or 0),
+            int(deferred_total or 0),
+            len(deferred_rows),
+        ]
+        total_count = max(total_candidates)
+        processed_count = max(0, total_count - unresolved_count)
+
+        # If a server supplied resolved/processed count is larger and the total
+        # was otherwise unavailable, keep that signal rather than returning 0.
+        history_resolved = history_counts.get("resolved")
+        if history_resolved is not None:
+            total_count = max(total_count, int(history_resolved) + unresolved_count)
+            processed_count = max(processed_count, int(history_resolved))
+
         data: dict[str, Any] = {
             "history_response": history_data,
+            "history_search_response": search_data,
             "deferred_fines_response": deferred_data,
             "_history_counts": history_counts,
             "_deferred_fine_counts": deferred_counts,
             "_deferred_fine_rows_for_plate": deferred_rows,
-            "_effective_violation_source": "property/vehicle-violation/history",
+            "_history_rows_for_plate": effective_history_rows,
+            "_total_violation_count": int(total_count),
+            "_processed_violation_count": int(processed_count),
+            "_unresolved_violation_count": int(unresolved_count),
+            "_effective_violation_source": (
+                "property/vehicle-violation/history" if history_rows
+                else "property/vehicle-violation/history?apk-search-fallback" if search_rows
+                else "none"
+            ),
             "_deferred_fine_effective_source": "property/deferred/fines" if deferred_rows else "none",
         }
-        # Keep history as the violation list; deferred/fines is the dedicated
-        # unresolved/fine list exposed separately by the coordinator.
-        violations = history_rows
-        http_status = history_status or deferred_status
-        raw_text_snapshot = history_text[:4000] if history_text else deferred_text[:4000]
+
+        violations = effective_history_rows
+        http_status = history_status or search_status or deferred_status
+        raw_text_snapshot = history_text[:4000] if history_text else search_text[:4000] if search_text else deferred_text[:4000]
         last_error = None
-        if history_status >= 400 and deferred_status >= 400:
-            last_error = f"History HTTP {history_status}; deferred/fines HTTP {deferred_status}"
+        if history_status >= 400 and deferred_status >= 400 and (not search_status or search_status >= 400):
+            last_error = f"History HTTP {history_status}; deferred/fines HTTP {deferred_status}; search fallback HTTP {search_status}"
 
         debug = build_response_debug(
             data=data,
@@ -272,8 +363,14 @@ class VNeTrafficApi:
         )
         debug["request_profiles"] = debug_requests
         debug["history_total"] = history_total
+        debug["history_rows"] = len(history_rows)
+        debug["search_total"] = search_total
+        debug["search_rows"] = len(search_rows)
         debug["deferred_fine_total"] = deferred_total
         debug["deferred_fine_rows"] = len(deferred_rows)
+        debug["total_violation_count"] = int(total_count)
+        debug["processed_violation_count"] = int(processed_count)
+        debug["unresolved_violation_count"] = int(unresolved_count)
         debug["vehicle_type_code"] = vehicle_code
         if last_error:
             debug["last_error"] = last_error
@@ -326,15 +423,62 @@ def _meta_total(data: Any) -> int | None:
 
 
 def extract_httpdata_rows(data: Any) -> list[dict[str, Any]]:
-    data = _flatten_embedded_json(data)
-    if isinstance(data, dict):
-        rows = data.get("data")
-        if isinstance(rows, list):
-            return [row for row in rows if isinstance(row, dict)]
-        nested = data.get("result")
-        if isinstance(nested, dict) and isinstance(nested.get("data"), list):
-            return [row for row in nested["data"] if isinstance(row, dict)]
+    """Extract list rows from the APK response wrappers.
+
+    v0.5.6 intentionally used the two known wrappers (data / result.data).
+    Keep those paths first, then recurse through the same JSON response so a
+    backend wrapper change cannot turn a populated response into a false zero.
+    """
+    root = _flatten_embedded_json(data)
+
+    def only_dicts(value: Any) -> list[dict[str, Any]]:
+        return [row for row in value if isinstance(row, dict)] if isinstance(value, list) else []
+
+    if isinstance(root, dict):
+        rows = only_dicts(root.get("data"))
+        if rows:
+            return rows
+        nested = root.get("result")
+        if isinstance(nested, dict):
+            rows = only_dicts(nested.get("data"))
+            if rows:
+                return rows
+
+    preferred = {
+        "data", "result", "items", "content", "records", "rows",
+        "results", "list", "violations", "violationlist",
+        "violationhistory", "pending", "fines", "fineList",
+    }
+    candidates: list[list[dict[str, Any]]] = []
+
+    def walk(obj: Any, depth: int = 0) -> None:
+        if depth > 12:
+            return
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if isinstance(value, list):
+                    rows2 = only_dicts(value)
+                    if rows2 and str(key).strip().lower().replace("_", "") in {x.lower().replace("_", "") for x in preferred}:
+                        candidates.append(rows2)
+                    walk(value, depth + 1)
+                elif isinstance(value, dict):
+                    walk(value, depth + 1)
+        elif isinstance(obj, list):
+            for value in obj:
+                walk(value, depth + 1)
+
+    walk(root)
+    if candidates:
+        return max(candidates, key=len)
     return []
+
+
+def _effective_count(server_total: int | None, rows: list[dict[str, Any]]) -> int | None:
+    """Never let an explicit server-side zero hide populated response rows."""
+    row_count = len(rows)
+    if server_total is None:
+        return row_count or None
+    return max(0, int(server_total), row_count)
 
 
 def _build_history_params(plate: str, vehicle_type: str, now_local: datetime) -> list[tuple[str, str]]:
@@ -348,6 +492,14 @@ def _build_history_params(plate: str, vehicle_type: str, now_local: datetime) ->
         ("licensePlate", vehicle_code),
         ("keySearch", plate),
     ]
+
+
+def _vehicle_type_label(vehicle_type: str) -> str:
+    return {
+        "auto": "Ôtô",
+        "motorcycle": "Mô tô",
+        "other": "Xe đạp điện",
+    }.get(vehicle_type or "auto", "Ôtô")
 
 
 def _calendar_add_months(value: datetime, months: int) -> datetime:
@@ -711,11 +863,11 @@ def _find_count_fields(obj: Any) -> dict[str, int]:
                     iv = None
                 if iv is not None:
                     if any(tok.replace("_", "") in k for tok in unresolved_tokens):
-                        out.setdefault("unresolved", iv)
+                        out["unresolved"] = max(out.get("unresolved", 0), iv)
                     elif any(tok.replace("_", "") in k for tok in resolved_tokens):
-                        out.setdefault("resolved", iv)
+                        out["resolved"] = max(out.get("resolved", 0), iv)
                     elif any(tok.replace("_", "") == k for tok in total_tokens):
-                        out.setdefault("total", iv)
+                        out["total"] = max(out.get("total", 0), iv)
                 if isinstance(value, (dict, list)):
                     walk(value, depth + 1)
         elif isinstance(x, list):
