@@ -55,6 +55,7 @@ class VNeTrafficApi:
         self._public_key: str | None = None
         self._remote_config_loaded = False
         self._login_lock = asyncio.Lock()
+        self._violation_detail_cache: dict[str, dict[str, Any] | None] = {}
 
     def _headers(self, authenticated: bool = False, include_app_headers: bool = True) -> dict[str, str]:
         headers: dict[str, str] = {
@@ -318,14 +319,94 @@ class VNeTrafficApi:
             len(deferred_rows),
         ]
         total_count = max(total_candidates)
-        processed_count = max(0, total_count - unresolved_count)
 
-        # If a server supplied resolved/processed count is larger and the total
-        # was otherwise unavailable, keep that signal rather than returning 0.
+        # IMPORTANT: the list endpoint can omit payment/handling state on some
+        # backend responses, and the deferred/fines endpoint can be the only
+        # source that contains the row used to derive the total. The APK also
+        # exposes a detail endpoint: /property/vehicle-violation/history/{id}.
+        # Use direct status on list/deferred rows first, then enrich ambiguous
+        # rows from that detail endpoint. This avoids the old error where a
+        # processed plate such as 17H00713 was total=1, deferred=1, processed=0.
+        candidate_rows: list[dict[str, Any]] = []
+        seen_candidate_ids: set[str] = set()
+        for row in [*effective_history_rows, *deferred_rows]:
+            row_id = first_value(row, "violationHistoryId", "vehicleViolationHistoryId", "violationId", "id")
+            key = str(row_id) if row_id not in (None, "") else "json:" + json.dumps(row, sort_keys=True, ensure_ascii=False, default=str)
+            if key not in seen_candidate_ids:
+                seen_candidate_ids.add(key)
+                candidate_rows.append(row)
+
+        detail_debug: list[dict[str, Any]] = []
+        detail_rows: dict[str, dict[str, Any]] = {}
+
+        async def enrich_from_detail(row: dict[str, Any]) -> dict[str, Any]:
+            row_id = first_value(row, "violationHistoryId", "vehicleViolationHistoryId", "violationId", "id")
+            if row_id in (None, ""):
+                return row
+            key = str(row_id)
+            if key in self._violation_detail_cache:
+                detail = self._violation_detail_cache[key]
+                if detail:
+                    merged = dict(row)
+                    merged.update(detail)
+                    return merged
+                return row
+
+            path = f"property/vehicle-violation/history/{key}"
+            d_status, d_data, d_text = await get_json(path)
+            parsed: dict[str, Any] | None = None
+            if d_status < 400 and d_data is not None:
+                detail_candidates = extract_violations(d_data)
+                if detail_candidates:
+                    parsed = detail_candidates[0]
+                elif isinstance(d_data, dict):
+                    # Detail responses are sometimes the record itself or a
+                    # record nested under data/result rather than an array.
+                    direct = d_data.get("data")
+                    if isinstance(direct, dict):
+                        parsed = direct
+                    elif isinstance(d_data.get("result"), dict):
+                        parsed = d_data["result"]
+                    elif _looks_like_violation_record(d_data):
+                        parsed = d_data
+            self._violation_detail_cache[key] = parsed
+            detail_debug.append({
+                "id": key,
+                "endpoint": "/property/vehicle-violation/history/{violationHistoryId}",
+                "http_status": d_status,
+                "extracted": bool(parsed),
+                "status": _status_values(parsed) if parsed else [],
+                "response_preview": d_text[:1200],
+            })
+            if parsed:
+                merged = dict(row)
+                merged.update(parsed)
+                detail_rows[key] = merged
+                return merged
+            return row
+
+        enriched_rows: list[dict[str, Any]] = []
+        for row in candidate_rows:
+            # Only request detail when the list row is not already explicitly
+            # resolved/unresolved; this keeps normal polling lightweight.
+            if (not _has_explicit_resolved_status(row) and
+                    not _has_explicit_unresolved_status(row)):
+                row = await enrich_from_detail(row)
+            enriched_rows.append(row)
+
+        processed_from_rows = sum(
+            1 for row in enriched_rows
+            if _is_resolved_violation(row)
+        )
+
         history_resolved = history_counts.get("resolved")
-        if history_resolved is not None:
-            total_count = max(total_count, int(history_resolved) + unresolved_count)
-            processed_count = max(processed_count, int(history_resolved))
+        deferred_resolved = deferred_counts.get("resolved")
+        server_resolved = max(
+            int(history_resolved or 0),
+            int(deferred_resolved or 0),
+        )
+        processed_count = max(processed_from_rows, server_resolved)
+        processed_count = min(processed_count, total_count) if total_count else 0
 
         data: dict[str, Any] = {
             "history_response": history_data,
@@ -371,9 +452,48 @@ class VNeTrafficApi:
         debug["total_violation_count"] = int(total_count)
         debug["processed_violation_count"] = int(processed_count)
         debug["unresolved_violation_count"] = int(unresolved_count)
+        debug["processed_status_classification"] = [
+            {
+                "id": first_value(row, "violationHistoryId", "vehicleViolationHistoryId", "violationId", "id"),
+                "processed": _is_resolved_violation(row),
+                "status": _status_values(row),
+                "paid_date": first_value(row, "paidDate", "paidDateText", "paymentDate", "paymentDateText"),
+                "source": (
+                    "history/deferred" if first_value(row, "violationHistoryId", "vehicleViolationHistoryId", "violationId", "id") not in detail_rows
+                    else "history-detail"
+                ),
+            }
+            for row in enriched_rows
+        ]
+        debug["processed_detail_requests"] = detail_debug
         debug["vehicle_type_code"] = vehicle_code
+
+        # VNeTraffic sometimes returns HTTP 200 while embedding an application
+        # error in JSON (for example status=500, CIT_042). Do not convert such a
+        # failed lookup into a new set of zero counters: let DataUpdateCoordinator
+        # keep the last successful state instead.
+        body_errors: list[str] = []
+        for label, payload, status_code in (
+            ("deferred/fines", deferred_data, deferred_status),
+            ("history", history_data, history_status),
+            ("history-search", search_data, search_status),
+        ):
+            if status_code >= 400:
+                body_errors.append(f"{label} HTTP {status_code}")
+                continue
+            app_status = _embedded_api_status(payload)
+            if app_status is not None and app_status >= 400:
+                code = find_first(payload, "code") or "API_ERROR"
+                message = find_first(payload, "message", "msg", "errorMessage", "error") or "Lỗi API"
+                body_errors.append(f"{label} {code}: {message}")
+
+        if body_errors and not effective_history_rows and not search_rows and not deferred_rows and not total_count:
+            raise VNeTrafficError("VNeTraffic API không trả được dữ liệu: " + " | ".join(body_errors[:3]))
+
         if last_error:
             debug["last_error"] = last_error
+        if body_errors:
+            debug["api_body_errors"] = body_errors
         return LookupResult(raw=data, violations=violations, debug=debug)
 
 
@@ -408,6 +528,32 @@ def _vehicle_type_code(vehicle_type: str) -> str:
         "motorcycle": "2",
         "other": "3",
     }.get(vehicle_type or "auto", "1")
+
+
+def _embedded_api_status(data: Any) -> int | None:
+    """Read application-level HTTP status from VNeTraffic JSON wrappers.
+
+    The API can return transport HTTP 200 with a body such as
+    {"code":"CIT_042", "status":500, ...}. That is an API failure, not an
+    empty result set.
+    """
+    if not isinstance(data, dict):
+        return None
+    value = data.get("status")
+    try:
+        ivalue = int(value)
+        return ivalue
+    except (TypeError, ValueError):
+        pass
+    for key in ("data", "result", "response", "error"):
+        nested = data.get(key)
+        if isinstance(nested, dict):
+            status = nested.get("status")
+            try:
+                return int(status)
+            except (TypeError, ValueError):
+                continue
+    return None
 
 
 def _meta_total(data: Any) -> int | None:
@@ -755,10 +901,16 @@ def build_response_debug(
 def _status_values(violation: dict[str, Any]) -> list[tuple[str, Any]]:
     values: list[tuple[str, Any]] = []
     status_names = {
-        "violationstatusname", "violationstatuscode", "statusname", "statuscode", "status",
-        "paymentstatusname", "paymentstatuscode", "paymentstatus", "processstatus", "processstatusname",
-        "handlingstatus", "handlingstatusname", "paidstatus", "paid", "ispaid", "ispayed",
-        "resolved", "isresolved", "processed", "isprocessed", "handled", "ishandled",
+        "violationstatusname", "violationstatuscode",
+        "statusname", "statuscode", "status", "statustext",
+        "paymentstatusname", "paymentstatuscode", "paymentstatus",
+        "processstatus", "processstatusname",
+        "handlingstatus", "handlingstatusname",
+        "paidstatus", "paid", "ispaid", "ispayed",
+        "resolved", "isresolved", "processed", "isprocessed",
+        "handled", "ishandled",
+        # Confirmed in the APK's History.kt model.
+        "chargestatusname", "statustype", "statustypetext",
     }
     def walk(obj: Any, depth: int = 0) -> None:
         if depth > 8:
@@ -791,8 +943,11 @@ def _is_explicit_resolved(status: str) -> bool:
     status = _norm_text(status)
     return any(marker in status for marker in (
         "đã xử phạt", "da xu phat", "đã nộp phạt", "da nop phat", "đã thanh toán", "da thanh toan",
-        "đã giải quyết", "da giai quyet", "đã xử lý", "da xu ly", "paid", "resolved", "processed",
-        "handled", "settled", "finished", "completed", "true",
+        "đã giải quyết", "da giai quyet", "đã xử lý", "da xu ly",
+        "đã chấp hành", "da chap hanh", "đã hoàn thành", "da hoan thanh",
+        "đã nộp tiền", "da nop tien",
+        "paid", "resolved", "processed", "handled", "settled", "finished",
+        "completed", "true", "complete",
     ))
 
 
@@ -806,6 +961,24 @@ def _is_explicit_unresolved(status: str) -> bool:
         "pending", "unpaid", "unresolved", "outstanding", "waiting", "new",
         "not handled", "unhandled", "false",
     ))
+
+
+def _has_explicit_resolved_status(violation: dict[str, Any]) -> bool:
+    values = _status_values(violation)
+    for _, value in values:
+        text = _norm_text(value)
+        if text and _is_explicit_resolved(text):
+            return True
+    return False
+
+
+def _has_explicit_unresolved_status(violation: dict[str, Any]) -> bool:
+    values = _status_values(violation)
+    for _, value in values:
+        text = _norm_text(value)
+        if text and _is_explicit_unresolved(text):
+            return True
+    return False
 
 
 def _is_unresolved_violation(violation: dict[str, Any]) -> bool:
@@ -829,6 +1002,53 @@ def _is_unresolved_violation(violation: dict[str, Any]) -> bool:
     if meaningful and resolved_seen:
         return False
     return True
+
+
+def _is_resolved_violation(violation: dict[str, Any]) -> bool:
+    """Return True only when the APK-style record explicitly indicates payment/handling.
+
+    Confirmed field names from the official VNeTraffic APK include:
+    isPaid, paidDate, paidDateText, paymentStatus, violationStatusCode,
+    and violationStatusName. The explicit payment fields take precedence over
+    generic status text because a record may contain both current processing
+    status and payment metadata.
+    """
+    values = _status_values(violation)
+
+    # isPaid is the strongest signal when the backend provides it.
+    for key, value in values:
+        if _key_norm(key) == "ispaid":
+            if isinstance(value, bool):
+                return value
+            text = _norm_text(value)
+            if text in {"true", "1", "yes", "paid", "paidtrue"}:
+                return True
+            if text in {"false", "0", "no", "unpaid", "unpaidfalse"}:
+                return False
+
+    # A non-empty paid date is an explicit paid signal from the APK model.
+    # Check this before paymentStatus because some backend responses can carry
+    # a stale/generic UNPAID status while still providing the actual paid date.
+    for key in ("paidDate", "paidDateText"):
+        value = find_first(violation, key)
+        if value not in (None, ""):
+            return True
+
+    # The APK contains PaymentStatus values PAID / UNPAID.
+    payment_values = [
+        value for key, value in values
+        if _key_norm(key) in {"paymentstatus", "paymentstatuscode", "paymentstatusname"}
+    ]
+    for value in payment_values:
+        text = _norm_text(value)
+        compact = text.replace("_", "").replace("-", "")
+        if compact in {"paid", "dapaid", "daxuphat", "danopphat", "dathanhtoan"}:
+            return True
+        if compact in {"unpaid", "unpaidstatus", "chuaxuphat", "chuanopphat", "chuathanhtoan"}:
+            return False
+
+    # Finally use the broader resolved/unresolved status classifier.
+    return bool(values) and not _is_unresolved_violation(violation)
 
 
 def _find_count_fields(obj: Any) -> dict[str, int]:
