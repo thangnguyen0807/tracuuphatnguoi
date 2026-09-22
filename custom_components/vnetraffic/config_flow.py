@@ -46,7 +46,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 vol.Required(CONF_LICENSE_PLATE): str,
                 vol.Optional(CONF_VEHICLE_TYPE, default="auto"): vol.In(VEHICLE_TYPES),
                 vol.Optional(CONF_SCAN_INTERVAL, default=DEFAULT_SCAN_INTERVAL): vol.All(
-                    vol.Coerce(int), vol.Range(min=300, max=86400)
+                    vol.Coerce(int), vol.Range(min=86400, max=86400)
                 ),
             })
             return self.async_show_form(step_id="user", data_schema=schema, errors=errors)
@@ -76,7 +76,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             vol.Required(CONF_LICENSE_PLATE): str,
             vol.Optional(CONF_VEHICLE_TYPE, default="auto"): vol.In(VEHICLE_TYPES),
             vol.Optional(CONF_SCAN_INTERVAL, default=DEFAULT_SCAN_INTERVAL): vol.All(
-                vol.Coerce(int), vol.Range(min=300, max=86400)
+                vol.Coerce(int), vol.Range(min=86400, max=86400)
             ),
         })
         return self.async_show_form(

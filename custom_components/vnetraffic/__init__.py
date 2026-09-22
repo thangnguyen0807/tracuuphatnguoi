@@ -36,7 +36,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass,
         api,
         entry.data[CONF_LICENSE_PLATE],
-        int(entry.data.get(CONF_SCAN_INTERVAL, 21600)),
+        86400,  # Exactly one automatic lookup cycle per vehicle per day
     )
     await coordinator.async_config_entry_first_refresh()
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
