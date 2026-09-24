@@ -1,6 +1,6 @@
 DOMAIN = "vnetraffic"
 NAME = "VNeTraffic"
-VERSION = "0.5.27"
+VERSION = "0.5.28"
 DEFAULT_BASE_URL = "https://citizen-api.vnetraffic.gov.vn"
 ## Effective API root reconstructed from the APK: decrypted API_ROOT = "api/citizens/" then App.onCreate() appends "v2".
 API_ROOT = "api/citizens/v2"

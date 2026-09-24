@@ -212,40 +212,7 @@ class VNeTrafficApi:
 
         vehicle_code = _vehicle_type_code(self._vehicle_type)
 
-        # EXACT v0.5.6 source for unresolved violations.
-        deferred_params = [("licensePlate", plate), ("type", vehicle_code)]
-        deferred_status, deferred_data, deferred_text = await get_json(
-            "property/deferred/fines", deferred_params
-        )
-        deferred_rows = extract_httpdata_rows(deferred_data)
-        if not deferred_rows and deferred_data is not None:
-            deferred_rows = extract_violations(deferred_data)
-        deferred_counts = _find_count_fields(deferred_data)
-        deferred_meta_total = _meta_total(deferred_data)
-        deferred_total = _effective_count(
-            deferred_meta_total if deferred_meta_total is not None else deferred_counts.get("total"),
-            deferred_rows,
-        )
-        if deferred_counts.get("unresolved") is not None:
-            deferred_total = max(int(deferred_total or 0), int(deferred_counts["unresolved"]))
-        if deferred_total is not None:
-            deferred_counts["deferred_total"] = deferred_total
-        debug_requests.append({
-            "endpoint": "/property/deferred/fines",
-            "profile": "v0.5.6-exact",
-            "params": deferred_params,
-            "http_status": deferred_status,
-            "extracted_count": len(deferred_rows),
-            "server_total": deferred_meta_total,
-            "effective_total": deferred_total,
-            "response_preview": deferred_text[:1600],
-        })
-
-        # One lookup cycle per plate per day. The current VNeTraffic backend
-        # is returning application-level CIT_042 for /history in this setup,
-        # while the same vehicle can still be queried from the official app.
-        # Avoid the second history-search request and use the endpoint that has
-        # been returning the fine/violation data reliably: deferred/fines.
+        # One daily lookup cycle per plate. Perform the deferred/fines request exactly once.
         deferred_params = [("licensePlate", plate), ("type", vehicle_code)]
         deferred_status, deferred_data, deferred_text = await get_json(
             "property/deferred/fines", deferred_params
@@ -345,6 +312,12 @@ class VNeTrafficApi:
                 message = find_first(payload, "message", "msg", "errorMessage", "error") or "Lỗi API"
                 body_errors.append(f"{label} {code}: {message}")
 
+        deferred_valid = _response_has_valid_violation_data(
+            deferred_data, deferred_status, deferred_rows, deferred_counts, deferred_meta_total
+        )
+        receipt_valid = _response_has_valid_receipt_data(receipt_data, receipt_status, receipt_rows)
+        lookup_valid = deferred_valid or receipt_valid
+
         data: dict[str, Any] = {
             "history_response": None,
             "history_search_response": None,
@@ -358,6 +331,7 @@ class VNeTrafficApi:
             "_total_violation_count": int(total_count),
             "_processed_violation_count": int(processed_count),
             "_unresolved_violation_count": int(unresolved_count),
+            "_lookup_valid": bool(lookup_valid),
             "_effective_violation_source": "property/deferred/fines",
             "_deferred_fine_effective_source": "property/deferred/fines" if deferred_rows else "none",
         }
@@ -395,18 +369,61 @@ class VNeTrafficApi:
         ]
         debug["processed_detail_requests"] = []
         debug["vehicle_type_code"] = vehicle_code
+        debug["deferred_response_valid"] = bool(deferred_valid)
+        debug["receipt_response_valid"] = bool(receipt_valid)
+        debug["lookup_valid"] = bool(lookup_valid)
         debug["lookup_day"] = today
         debug["lookup_policy"] = "one lookup cycle per license plate per local calendar day"
         if body_errors:
             debug["api_body_errors"] = body_errors
 
         result = LookupResult(raw=data, violations=effective_rows, debug=debug)
-        # Cache even an API-error result for today so HA never hammers the API
-        # after CIT_029/CIT_042 or repeated manual refreshes. The next local
-        # calendar day will perform a fresh lookup.
+        # Cache exactly one lookup cycle per local calendar day. Invalid API
+        # responses are also cached to avoid additional requests that day;
+        # coordinator.py will preserve the last-known-good value instead of zeroing it.
         self._daily_lookup_cache[plate] = (today, result)
         return result
 
+
+
+
+def _response_has_valid_violation_data(
+    data: Any,
+    http_status: int,
+    rows: list[dict[str, Any]],
+    counts: dict[str, int],
+    meta_total: int | None,
+) -> bool:
+    """Return True only when deferred/fines supplied a usable data payload."""
+    if http_status >= 400 or data is None:
+        return False
+    app_status = _embedded_api_status(data)
+    if app_status is not None and app_status >= 400:
+        return False
+    if rows:
+        return True
+    if meta_total is not None:
+        return True
+    if counts:
+        return True
+    root = _flatten_embedded_json(data)
+    if isinstance(root, dict):
+        for key in ("data", "result", "items", "content", "records", "rows", "list", "violations"):
+            if key in root:
+                value = root.get(key)
+                if isinstance(value, (list, dict)):
+                    return True
+    return False
+
+
+def _response_has_valid_receipt_data(data: Any, http_status: int, rows: list[dict[str, Any]]) -> bool:
+    """Return True only when receipt/fine supplied a usable receipt payload."""
+    if http_status >= 400 or data is None:
+        return False
+    app_status = _embedded_api_status(data)
+    if app_status is not None and app_status >= 400:
+        return False
+    return bool(rows)
 
 
 def encrypt_apk_payload(payload: dict[str, Any], public_key_pem: str) -> tuple[str, str]:
