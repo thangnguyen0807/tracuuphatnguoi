@@ -4,6 +4,8 @@ import copy
 import hashlib
 import logging
 from datetime import timedelta
+
+from homeassistant.util import dt as dt_util
 from typing import Any
 
 from homeassistant.helpers.storage import Store
@@ -27,6 +29,13 @@ class VNeTrafficCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._store = Store(hass, _STORE_VERSION, _store_key(license_plate))
         self._last_good: dict[str, Any] | None = None
         self._store_loaded = False
+        self._update_meta: dict[str, Any] = {
+            "last_update_attempt_at": None,
+            "last_successful_update_at": None,
+            "last_update_status": "Chưa cập nhật",
+            "last_update_error": None,
+            "last_update_day": None,
+        }
         super().__init__(
             hass,
             logger=_LOGGER,
@@ -45,10 +54,13 @@ class VNeTrafficCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             stored = None
         if isinstance(stored, dict) and isinstance(stored.get("data"), dict):
             self._last_good = stored["data"]
+            stored_meta = stored.get("meta")
+            if isinstance(stored_meta, dict):
+                self._update_meta.update(stored_meta)
             _LOGGER.debug("Loaded last-known-good VNeTraffic data for %s", self.license_plate)
 
     async def _save_last_good(self, data: dict[str, Any]) -> None:
-        payload = {"data": copy.deepcopy(data)}
+        payload = {"data": copy.deepcopy(data), "meta": copy.deepcopy(self._update_meta)}
         try:
             await self._store.async_save(payload)
         except Exception as err:
@@ -56,14 +68,46 @@ class VNeTrafficCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_update_data(self):
         await self.async_load_last_good()
+        now = dt_util.now()
+        now_iso = now.isoformat(timespec="seconds")
+        today = now.date().isoformat()
+
+        # Enforce one lookup per local calendar day even across Home Assistant restarts.
+        if self._last_good and self._update_meta.get("last_update_day") == today:
+            data = copy.deepcopy(self._last_good)
+            debug = data.setdefault("debug", {})
+            debug["served_from_last_good"] = True
+            debug["daily_lookup_already_done"] = True
+            debug["last_update_status"] = self._update_meta.get("last_update_status")
+            debug["last_update_attempt_at"] = self._update_meta.get("last_update_attempt_at")
+            debug["last_successful_update_at"] = self._update_meta.get("last_successful_update_at")
+            debug["last_update_error"] = self._update_meta.get("last_update_error")
+            return data
+
+        self._update_meta.update({
+            "last_update_attempt_at": now_iso,
+            "last_update_status": "Đang cập nhật",
+            "last_update_error": None,
+            "last_update_day": today,
+        })
+
         try:
             result = await self.api.lookup(self.license_plate)
         except VNeTrafficError as err:
+            error_text = str(err)
+            self._update_meta.update({
+                "last_update_status": "Lỗi - giữ dữ liệu cũ",
+                "last_update_error": error_text,
+            })
             if self._last_good:
                 data = copy.deepcopy(self._last_good)
                 debug = data.setdefault("debug", {})
                 debug["served_from_last_good"] = True
-                debug["last_good_reason"] = str(err)
+                debug["last_update_status"] = self._update_meta["last_update_status"]
+                debug["last_update_attempt_at"] = self._update_meta["last_update_attempt_at"]
+                debug["last_successful_update_at"] = self._update_meta["last_successful_update_at"]
+                debug["last_update_error"] = error_text
+                await self._save_last_good(data)
                 return data
             raise UpdateFailed(str(err)) from err
 
@@ -72,6 +116,16 @@ class VNeTrafficCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         valid = bool(raw.get("_lookup_valid", False))
 
         if valid:
+            self._update_meta.update({
+                "last_update_status": "Thành công",
+                "last_successful_update_at": now_iso,
+                "last_update_error": None,
+            })
+            debug = copy.deepcopy(result.debug)
+            debug["last_update_status"] = self._update_meta["last_update_status"]
+            debug["last_update_attempt_at"] = self._update_meta["last_update_attempt_at"]
+            debug["last_successful_update_at"] = self._update_meta["last_successful_update_at"]
+            debug["last_update_error"] = None
             data = {
                 "raw": raw,
                 "violations": result.violations,
@@ -79,19 +133,37 @@ class VNeTrafficCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "total_violation_count": int(raw.get("_total_violation_count", len(result.violations))),
                 "processed_violation_count": int(raw.get("_processed_violation_count", 0)),
                 "unresolved_violation_count": int(raw.get("_unresolved_violation_count", len(pending_rows))),
-                "debug": result.debug,
+                "debug": debug,
             }
             self._last_good = copy.deepcopy(data)
             await self._save_last_good(data)
             return data
 
+        error_text = "Daily lookup did not return a valid data payload"
+        body_errors = result.debug.get("api_body_errors") if isinstance(result.debug, dict) else None
+        if body_errors:
+            error_text = " | ".join(str(item) for item in body_errors)
+        self._update_meta.update({
+            "last_update_status": "Lỗi - giữ dữ liệu cũ",
+            "last_update_error": error_text,
+        })
+
         if self._last_good:
             data = copy.deepcopy(self._last_good)
             debug = data.setdefault("debug", {})
             debug["served_from_last_good"] = True
-            debug["last_good_reason"] = "Daily lookup did not return a valid data payload"
+            debug["last_update_status"] = self._update_meta["last_update_status"]
+            debug["last_update_attempt_at"] = self._update_meta["last_update_attempt_at"]
+            debug["last_successful_update_at"] = self._update_meta["last_successful_update_at"]
+            debug["last_update_error"] = error_text
             debug["last_api_debug"] = result.debug
+            await self._save_last_good(data)
             return data
 
         # First-ever lookup failed or returned only an API error. Do not invent zeroes.
         raise UpdateFailed("VNeTraffic chưa trả về dữ liệu hợp lệ cho biển số này")
+
+    @property
+    def update_meta(self) -> dict[str, Any]:
+        return copy.deepcopy(self._update_meta)
+

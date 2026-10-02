@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from homeassistant.components.sensor import SensorEntity
+from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .api import first_value, _status_debug
@@ -53,8 +53,71 @@ def _attributes(coordinator: VNeTrafficCoordinator, plate: str, vehicle_type: st
         "unresolved_violations": [_build_violation_attributes(v) for v in pending],
         "unresolved_status_debug": [_status_debug(v) for v in violations],
         "api_debug": data.get("debug", {}) if isinstance(data, dict) else {},
+        "last_update_attempt_at": coordinator.update_meta.get("last_update_attempt_at"),
+        "last_successful_update_at": coordinator.update_meta.get("last_successful_update_at"),
+        "last_update_status": coordinator.update_meta.get("last_update_status"),
+        "last_update_error": coordinator.update_meta.get("last_update_error"),
+        "last_update_day": coordinator.update_meta.get("last_update_day"),
         "source": "VNeTraffic official citizen API",
     }
+
+
+class VNeTrafficLastUpdateSensor(CoordinatorEntity[VNeTrafficCoordinator], SensorEntity):
+    _attr_icon = "mdi:update"
+    _attr_has_entity_name = True
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+
+    def __init__(self, coordinator, config):
+        super().__init__(coordinator)
+        plate = config[CONF_LICENSE_PLATE]
+        self._attr_unique_id = f"{DOMAIN}_{plate.replace(' ', '').lower()}_last_update"
+        self._attr_name = "Cập nhật gần nhất"
+
+    @property
+    def native_value(self):
+        value = self.coordinator.update_meta.get("last_update_attempt_at")
+        if not value:
+            return None
+        try:
+            from datetime import datetime
+            return datetime.fromisoformat(value)
+        except (TypeError, ValueError):
+            return None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        meta = self.coordinator.update_meta
+        return {
+            "last_successful_update_at": meta.get("last_successful_update_at"),
+            "last_update_status": meta.get("last_update_status"),
+            "last_update_error": meta.get("last_update_error"),
+            "last_update_day": meta.get("last_update_day"),
+        }
+
+
+class VNeTrafficUpdateStatusSensor(CoordinatorEntity[VNeTrafficCoordinator], SensorEntity):
+    _attr_icon = "mdi:cloud-sync"
+    _attr_has_entity_name = True
+
+    def __init__(self, coordinator, config):
+        super().__init__(coordinator)
+        plate = config[CONF_LICENSE_PLATE]
+        self._attr_unique_id = f"{DOMAIN}_{plate.replace(' ', '').lower()}_update_status"
+        self._attr_name = "Trạng thái cập nhật"
+
+    @property
+    def native_value(self) -> str:
+        return str(self.coordinator.update_meta.get("last_update_status") or "Chưa cập nhật")
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        meta = self.coordinator.update_meta
+        return {
+            "last_update_attempt_at": meta.get("last_update_attempt_at"),
+            "last_successful_update_at": meta.get("last_successful_update_at"),
+            "last_update_error": meta.get("last_update_error"),
+            "last_update_day": meta.get("last_update_day"),
+        }
 
 
 async def async_setup_entry(hass, entry, async_add_entities):
@@ -65,6 +128,8 @@ async def async_setup_entry(hass, entry, async_add_entities):
             VNeTrafficSensor(coordinator, config),
             VNeTrafficProcessedSensor(coordinator, config),
             VNeTrafficUnresolvedSensor(coordinator, config),
+            VNeTrafficLastUpdateSensor(coordinator, config),
+            VNeTrafficUpdateStatusSensor(coordinator, config),
         ],
         update_before_add=True,
     )
