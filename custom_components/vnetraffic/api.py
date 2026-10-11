@@ -7,6 +7,7 @@ import uuid
 import base64
 import os
 import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
 
 from homeassistant.util import dt as dt_util
@@ -18,6 +19,8 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import padding as sym_padding
 
 from .firebase_remote_config import fetch_remote_config
+_LOGGER = logging.getLogger(__name__)
+
 from .const import (
     API_ROOT,
     API_VERSION,
@@ -171,6 +174,26 @@ class VNeTrafficApi:
             if not self.access_token:
                 await self.login()
 
+    async def _reauthenticate_after_401(self, token_used: str | None) -> None:
+        """Refresh an expired access token, falling back to a full login.
+
+        The client is shared by all configured plates for an account. If another
+        concurrent request already rotated the token, do not refresh/login again.
+        """
+        async with self._login_lock:
+            if self.access_token and self.access_token != token_used:
+                return
+
+            # Prefer the official refresh-token flow. If the refresh token is also
+            # expired/rejected, discard both tokens and perform a fresh login using
+            # the credentials saved in the config entry.
+            if self.refresh_token and await self.refresh():
+                return
+
+            self.access_token = None
+            self.refresh_token = None
+            await self.login()
+
     async def lookup(self, license_plate: str) -> LookupResult:
         plate = normalize_plate(license_plate)
         if not plate:
@@ -185,6 +208,7 @@ class VNeTrafficApi:
         await self._load_remote_config()
 
         debug_requests: list[dict[str, Any]] = []
+        auth_recovery_events: list[dict[str, Any]] = []
         history_data: Any = None
         deferred_data: Any = None
         history_text = ""
@@ -193,22 +217,57 @@ class VNeTrafficApi:
         deferred_status = 0
 
         async def get_json(path: str, params: list[tuple[str, str]] | None = None) -> tuple[int, Any, str]:
+            """GET JSON; on HTTP 401 refresh/re-login and retry this request once."""
             url = f"{self.base_url}/{path.lstrip('/') }"
-            try:
-                async with self.session.get(
-                    url,
-                    params=params,
-                    headers=self._headers(authenticated=True),
-                    timeout=aiohttp.ClientTimeout(total=20),
-                ) as response:
-                    text = await response.text()
-                    try:
-                        payload = await response.json(content_type=None)
-                    except Exception:
-                        payload = None
-                    return response.status, payload, text
-            except aiohttp.ClientError as err:
-                raise VNeTrafficError(f"Không kết nối được VNeTraffic API: {err}") from err
+
+            async def perform_get() -> tuple[int, Any, str, str | None]:
+                token_used = self.access_token
+                try:
+                    async with self.session.get(
+                        url,
+                        params=params,
+                        headers=self._headers(authenticated=True),
+                        timeout=aiohttp.ClientTimeout(total=20),
+                    ) as response:
+                        text = await response.text()
+                        try:
+                            payload = await response.json(content_type=None)
+                        except Exception:
+                            payload = None
+                        return response.status, payload, text, token_used
+                except aiohttp.ClientError as err:
+                    raise VNeTrafficError(f"Không kết nối được VNeTraffic API: {err}") from err
+
+            status, payload, text, token_used = await perform_get()
+            if status == 401:
+                event: dict[str, Any] = {
+                    "endpoint": path,
+                    "initial_http_status": 401,
+                    "recovery": "attempted",
+                }
+                _LOGGER.warning(
+                    "VNeTraffic endpoint %s returned HTTP 401 for plate %s; refreshing auth and retrying once",
+                    path,
+                    plate,
+                )
+                try:
+                    await self._reauthenticate_after_401(token_used)
+                except VNeTrafficError as err:
+                    event["recovery"] = "refresh_and_login_failed"
+                    event["error"] = str(err)
+                    auth_recovery_events.append(event)
+                    raise
+                status, payload, text, _ = await perform_get()
+                event["retry_http_status"] = status
+                event["recovery"] = "recovered" if status < 400 else "retry_failed"
+                auth_recovery_events.append(event)
+                if status == 401:
+                    _LOGGER.error(
+                        "VNeTraffic endpoint %s still returned HTTP 401 after refresh/login for plate %s",
+                        path,
+                        plate,
+                    )
+            return status, payload, text
 
         vehicle_code = _vehicle_type_code(self._vehicle_type)
 
@@ -345,6 +404,7 @@ class VNeTrafficApi:
             violations=effective_rows,
         )
         debug["request_profiles"] = debug_requests
+        debug["auth_recovery"] = auth_recovery_events
         debug["history_total"] = None
         debug["history_rows"] = 0
         debug["search_total"] = None
