@@ -1,0 +1,91 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Add vehicle",
+        "description": "Add a vehicle and choose whether to use a saved VNeTraffic account or sign in with a different account.",
+        "data": {
+          "license_plate": "License plate",
+          "vehicle_type": "Vehicle type",
+          "scan_interval": "Lookup interval (seconds)",
+          "username": "VNeTraffic username",
+          "password": "VNeTraffic password",
+          "account_mode": "Lookup account"
+        }
+      },
+      "existing_account": {
+        "title": "Use a saved account",
+        "data": {
+          "account_selection": "Select account"
+        }
+      },
+      "new_account": {
+        "title": "Sign in with another account",
+        "description": "Enter the credentials of the VNeTraffic account used to look up this vehicle.",
+        "data": {
+          "username": "Username",
+          "password": "Password"
+        }
+      },
+      "confirm_credentials": {
+        "title": "Account sign-in verified",
+        "description": "VNeTraffic authenticated account {account} and issued an access token. Select Confirm to save this vehicle. No fine lookup was performed."
+      }
+    },
+    "error": {
+      "invalid_plate": "Please enter a license plate",
+      "required": "This field is required",
+      "account_not_found": "This saved account no longer exists. Select another account.",
+      "login_rejected": "VNeTraffic rejected this sign-in. Check username, password or account status. No changes were saved.",
+      "cannot_connect": "Cannot reach VNeTraffic. Credentials have not been verified or saved.",
+      "cannot_verify": "VNeTraffic did not provide a usable sign-in result. No changes were saved.",
+      "credentials_missing": "No saved credentials are available for this vehicle."
+    },
+    "abort": {
+      "already_configured": "This vehicle is already configured"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Change vehicle lookup account",
+        "description": "Check the saved account password or switch this vehicle to another VNeTraffic account. Previous fine data is preserved.",
+        "data": {
+          "account_mode": "Lookup account"
+        }
+      },
+      "existing_account": {
+        "title": "Choose a saved account",
+        "data": {
+          "account_selection": "Account"
+        }
+      },
+      "new_account": {
+        "title": "Sign in with a different account",
+        "data": {
+          "username": "Username",
+          "password": "Password"
+        }
+      },
+      "check_current": {
+        "title": "Check current account password",
+        "description": "Select Submit to verify this vehicle’s current saved credentials using the VNeTraffic sign-in API. No fine lookup is performed."
+      },
+      "confirm_account": {
+        "title": "Account sign-in verified",
+        "description": "VNeTraffic authenticated account {account}. Select Confirm to use it for this vehicle. Existing data will be preserved."
+      }
+    },
+    "error": {
+      "required": "This field is required",
+      "account_not_found": "This saved account no longer exists. Select another account.",
+      "login_rejected": "VNeTraffic rejected this sign-in. Check username, password or account status. No changes were saved.",
+      "cannot_connect": "Cannot reach VNeTraffic. Credentials have not been verified or saved.",
+      "cannot_verify": "VNeTraffic did not provide a usable sign-in result. No changes were saved.",
+      "credentials_missing": "No saved credentials are available for this vehicle."
+    },
+    "abort": {
+      "credentials_valid": "Login successful: the saved account and password were accepted. Vehicle settings were not changed."
+    }
+  }
+}

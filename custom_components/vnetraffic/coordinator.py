@@ -23,9 +23,10 @@ def _store_key(plate: str) -> str:
 
 
 class VNeTrafficCoordinator(DataUpdateCoordinator[dict[str, Any]]):
-    def __init__(self, hass, api: VNeTrafficApi, license_plate: str, scan_interval: int):
+    def __init__(self, hass, api: VNeTrafficApi, license_plate: str, scan_interval: int, vehicle_type: str = "auto"):
         self.api = api
         self.license_plate = license_plate
+        self.vehicle_type = vehicle_type
         self._store = Store(hass, _STORE_VERSION, _store_key(license_plate))
         self._last_good: dict[str, Any] | None = None
         self._store_loaded = False
@@ -92,7 +93,7 @@ class VNeTrafficCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         })
 
         try:
-            result = await self.api.lookup(self.license_plate)
+            result = await self.api.lookup(self.license_plate, vehicle_type=self.vehicle_type)
         except VNeTrafficError as err:
             error_text = str(err)
             self._update_meta.update({

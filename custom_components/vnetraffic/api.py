@@ -36,6 +36,10 @@ class VNeTrafficError(Exception):
     """Expected VNeTraffic API error."""
 
 
+class VNeTrafficLoginRejected(VNeTrafficError):
+    """Login endpoint explicitly rejected the supplied credentials/request."""
+
+
 @dataclass
 class LookupResult:
     raw: dict[str, Any]
@@ -114,7 +118,8 @@ class VNeTrafficApi:
             ) as response:
                 text = await response.text()
                 if response.status >= 400:
-                    raise VNeTrafficError(
+                    error_type = VNeTrafficLoginRejected if response.status in (400, 401, 403) else VNeTrafficError
+                    raise error_type(
                         f"VNeTraffic API đăng nhập HTTP {response.status}: {_api_message(text)} (URL: {url})"
                     )
                 try:
@@ -127,7 +132,10 @@ class VNeTrafficApi:
         access = find_first(data, "accessToken", "accessTKN", "token", "access_token")
         refresh = find_first(data, "refreshToken", "refreshTKN", "refresh_token")
         if not access:
-            message = find_first(data, "message", "msg", "errorMessage", "error") or "Không nhận được access token"
+            message = str(find_first(data, "message", "msg", "errorMessage", "error") or "Không nhận được access token")
+            normalized = message.casefold()
+            if any(x in normalized for x in ("mật khẩu", "đăng nhập", "tài khoản", "password", "login", "invalid credentials")):
+                raise VNeTrafficLoginRejected("Đăng nhập VNeTraffic bị từ chối")
             raise VNeTrafficError(f"Đăng nhập VNeTraffic không thành công: {message}")
         self.access_token = str(access)
         self.refresh_token = str(refresh) if refresh else None
@@ -194,7 +202,7 @@ class VNeTrafficApi:
             self.refresh_token = None
             await self.login()
 
-    async def lookup(self, license_plate: str) -> LookupResult:
+    async def lookup(self, license_plate: str, vehicle_type: str | None = None) -> LookupResult:
         plate = normalize_plate(license_plate)
         if not plate:
             raise VNeTrafficError("Biển số xe không hợp lệ")
@@ -269,13 +277,16 @@ class VNeTrafficApi:
                     )
             return status, payload, text
 
-        vehicle_code = _vehicle_type_code(self._vehicle_type)
+        vehicle_code = _vehicle_type_code(vehicle_type or self._vehicle_type)
 
         # One daily lookup cycle per plate. Perform the deferred/fines request exactly once.
         deferred_params = [("licensePlate", plate), ("type", vehicle_code)]
         deferred_status, deferred_data, deferred_text = await get_json(
             "property/deferred/fines", deferred_params
         )
+        # HTTP 200 does not guarantee success: CIT_029 is a business-level
+        # daily-limit rejection. Do not issue a receipt/fine request afterwards.
+        deferred_rate_limited = _is_daily_lookup_limit(deferred_data)
         deferred_rows = extract_httpdata_rows(deferred_data)
         if not deferred_rows and deferred_data is not None:
             deferred_rows = extract_violations(deferred_data)
@@ -316,25 +327,31 @@ class VNeTrafficApi:
             ("timeRange", end_time),
             ("licensePlate", plate),
         ]
-        try:
-            receipt_status, receipt_data, receipt_text = await get_json(
-                "property/receipt/fine", receipt_params
-            )
-            receipt_rows = extract_receipts(receipt_data)
-            receipt_total = len(receipt_rows) or None
-        except VNeTrafficError as err:
-            receipt_text = str(err)
-            receipt_status = 0
-        debug_requests.append({
-            "endpoint": "/property/receipt/fine",
-            "profile": "daily-lookup",
-            "params": receipt_params,
-            "http_status": receipt_status,
-            "extracted_count": len(receipt_rows),
-            "server_total": _meta_total(receipt_data),
-            "effective_total": receipt_total,
-            "response_preview": receipt_text[:1600],
-        })
+        if deferred_rate_limited:
+            # No additional remote requests after the server reports a limit.
+            # This response must not be treated as zero violations.
+            receipt_skipped_reason = "deferred/fines CIT_029"
+        else:
+            try:
+                receipt_status, receipt_data, receipt_text = await get_json(
+                    "property/receipt/fine", receipt_params
+                )
+                receipt_rows = extract_receipts(receipt_data)
+                receipt_total = len(receipt_rows) or None
+            except VNeTrafficError as err:
+                receipt_text = str(err)
+                receipt_status = 0
+            debug_requests.append({
+                "endpoint": "/property/receipt/fine",
+                "profile": "daily-lookup",
+                "params": receipt_params,
+                "http_status": receipt_status,
+                "extracted_count": len(receipt_rows),
+                "server_total": _meta_total(receipt_data),
+                "effective_total": receipt_total,
+                "response_preview": receipt_text[:1600],
+            })
+            receipt_skipped_reason = None
 
         effective_rows = deferred_rows
         total_count = max(
@@ -365,6 +382,12 @@ class VNeTrafficApi:
             if status_code >= 400:
                 body_errors.append(f"{label} HTTP {status_code}")
                 continue
+            # VNeTraffic uses HTTP 200 and body status 200 for CIT_029 rate limits.
+            # Do not treat this application-level failure as an empty result.
+            if _is_daily_lookup_limit(payload):
+                message = payload.get("message") or "Đã đạt giới hạn tra cứu"
+                body_errors.append(f"{label} CIT_029: {message}")
+                continue
             app_status = _embedded_api_status(payload)
             if app_status is not None and app_status >= 400:
                 code = find_first(payload, "code") or "API_ERROR"
@@ -375,7 +398,9 @@ class VNeTrafficApi:
             deferred_data, deferred_status, deferred_rows, deferred_counts, deferred_meta_total
         )
         receipt_valid = _response_has_valid_receipt_data(receipt_data, receipt_status, receipt_rows)
-        lookup_valid = deferred_valid or receipt_valid
+        # The deferred/fines endpoint is the authoritative pending-fine source.
+        # A receipt result alone cannot prove that the plate lookup succeeded.
+        lookup_valid = deferred_valid and not deferred_rate_limited
 
         data: dict[str, Any] = {
             "history_response": None,
@@ -404,6 +429,23 @@ class VNeTrafficApi:
             violations=effective_rows,
         )
         debug["request_profiles"] = debug_requests
+        debug["receipt_skipped_reason"] = receipt_skipped_reason
+        debug["deferred_api_code"] = (
+            str(deferred_data.get("code"))
+            if isinstance(deferred_data, dict) and deferred_data.get("code") is not None
+            else None
+        )
+        # Safe protocol fingerprint only: never store authentication headers,
+        # passwords, tokens, client-secret or device ID in diagnostic fields.
+        debug["lookup_request_metadata"] = {
+            "method": "GET",
+            "endpoint": "/property/deferred/fines",
+            "query_keys": ["licensePlate", "type"],
+            "client_platform": PLATFORM,
+            "app_version": APP_VERSION,
+            "api_version": API_VERSION,
+            "client_type": "home_assistant_android_derived",
+        }
         debug["auth_recovery"] = auth_recovery_events
         debug["history_total"] = None
         debug["history_rows"] = 0
@@ -447,6 +489,14 @@ class VNeTrafficApi:
 
 
 
+def _is_daily_lookup_limit(payload: Any) -> bool:
+    """Recognize a server-side rate limit even with HTTP status 200."""
+    return (
+        isinstance(payload, dict)
+        and str(payload.get("code") or "").strip().upper() == "CIT_029"
+    )
+
+
 def _response_has_valid_violation_data(
     data: Any,
     http_status: int,
@@ -455,7 +505,7 @@ def _response_has_valid_violation_data(
     meta_total: int | None,
 ) -> bool:
     """Return True only when deferred/fines supplied a usable data payload."""
-    if http_status >= 400 or data is None:
+    if http_status >= 400 or data is None or _is_daily_lookup_limit(data):
         return False
     app_status = _embedded_api_status(data)
     if app_status is not None and app_status >= 400:
