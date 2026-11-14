@@ -1,0 +1,91 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Thêm xe VNeTraffic",
+        "description": "Chọn tài khoản đã lưu hoặc đăng nhập tài khoản VNeTraffic khác cho xe mới.",
+        "data": {
+          "license_plate": "Biển số xe",
+          "vehicle_type": "Loại xe",
+          "scan_interval": "Chu kỳ tra cứu (giây)",
+          "username": "Tài khoản VNeTraffic",
+          "password": "Mật khẩu",
+          "account_mode": "Tài khoản tra cứu"
+        }
+      },
+      "existing_account": {
+        "title": "Dùng tài khoản đã lưu",
+        "data": {
+          "account_selection": "Chọn tài khoản"
+        }
+      },
+      "new_account": {
+        "title": "Đăng nhập tài khoản khác",
+        "description": "Nhập tài khoản VNeTraffic sử dụng để tra cứu xe này.",
+        "data": {
+          "username": "Tài khoản VNeTraffic",
+          "password": "Mật khẩu"
+        }
+      },
+      "confirm_credentials": {
+        "title": "Xác thực tài khoản thành công",
+        "description": "VNeTraffic đã xác thực tài khoản {account} và cấp access token. Nhấn Xác nhận để lưu xe. Không thực hiện tra cứu phạt nguội."
+      }
+    },
+    "error": {
+      "invalid_plate": "Hãy nhập biển số xe",
+      "required": "Không được bỏ trống",
+      "account_not_found": "Không tìm thấy tài khoản này. Hãy chọn tài khoản khác.",
+      "login_rejected": "VNeTraffic từ chối đăng nhập. Kiểm tra tài khoản, mật khẩu hoặc trạng thái tài khoản. Chưa lưu thay đổi.",
+      "cannot_connect": "Không kết nối được VNeTraffic. Chưa xác thực hoặc lưu tài khoản.",
+      "cannot_verify": "VNeTraffic không trả kết quả xác thực hợp lệ. Chưa lưu thay đổi.",
+      "credentials_missing": "Xe này chưa có thông tin đăng nhập được lưu."
+    },
+    "abort": {
+      "already_configured": "Xe này đã được cấu hình"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Đổi tài khoản tra cứu cho xe",
+        "description": "Kiểm tra mật khẩu đang lưu hoặc đổi tài khoản tra cứu cho xe. Giữ nguyên dữ liệu phạt nguội trước đó.",
+        "data": {
+          "account_mode": "Tài khoản tra cứu"
+        }
+      },
+      "existing_account": {
+        "title": "Chọn tài khoản đã lưu",
+        "data": {
+          "account_selection": "Tài khoản"
+        }
+      },
+      "new_account": {
+        "title": "Đăng nhập tài khoản khác",
+        "data": {
+          "username": "Tài khoản VNeTraffic",
+          "password": "Mật khẩu"
+        }
+      },
+      "check_current": {
+        "title": "Kiểm tra mật khẩu đang sử dụng",
+        "description": "Nhấn Gửi để kiểm tra thông tin đăng nhập đang lưu với API đăng nhập VNeTraffic. Không thực hiện tra cứu phạt nguội."
+      },
+      "confirm_account": {
+        "title": "Xác thực tài khoản thành công",
+        "description": "VNeTraffic đã xác thực tài khoản {account}. Nhấn Xác nhận để dùng tài khoản này cho xe. Dữ liệu cũ được giữ nguyên."
+      }
+    },
+    "error": {
+      "required": "Không được bỏ trống",
+      "account_not_found": "Tài khoản đã lưu không tồn tại. Hãy chọn tài khoản khác.",
+      "login_rejected": "VNeTraffic từ chối đăng nhập. Kiểm tra tài khoản, mật khẩu hoặc trạng thái tài khoản. Chưa lưu thay đổi.",
+      "cannot_connect": "Không kết nối được VNeTraffic. Chưa xác thực hoặc lưu tài khoản.",
+      "cannot_verify": "VNeTraffic không trả kết quả xác thực hợp lệ. Chưa lưu thay đổi.",
+      "credentials_missing": "Xe này chưa có thông tin đăng nhập được lưu."
+    },
+    "abort": {
+      "credentials_valid": "Đăng nhập thành công: tài khoản và mật khẩu đang lưu đã được chấp nhận. Không thay đổi cấu hình xe."
+    }
+  }
+}
